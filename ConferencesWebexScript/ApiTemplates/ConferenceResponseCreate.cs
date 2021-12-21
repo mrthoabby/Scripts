@@ -2,7 +2,7 @@
 
 namespace ConferencesWebexScript.ApiTemplates
 {
-    internal class ConferenceResponse
+    internal class ConferenceResponseCreate
     {
         public string id { get; set; }
         public string title { get; set; }

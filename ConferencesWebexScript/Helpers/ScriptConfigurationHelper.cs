@@ -1,11 +1,7 @@
 ﻿using ConferencesWebexScript.Entities;
 using Microsoft.Extensions.Configuration;
 using System;
-using System.Collections.Generic;
 using System.IO;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace ConferencesWebexScript.Helpers
 {
@@ -20,21 +16,19 @@ namespace ConferencesWebexScript.Helpers
         {
             try
             {
-                var ok = Directory.GetCurrentDirectory();
-                var Config = new ConfigurationBuilder().SetBasePath(Directory.GetCurrentDirectory()).AddJsonFile(_appSettings, true, true);
+                string ok = Directory.GetCurrentDirectory();
+                IConfigurationBuilder Config = new ConfigurationBuilder().SetBasePath(Directory.GetCurrentDirectory()).AddJsonFile(_appSettings, true, true);
                 return Config.Build();
             }
             catch (Exception e)
             {
-                throw new Exception(e.Message,e);
+                throw new Exception(e.Message, e);
             }
-           
+
         }
-        internal static DataCreate GetConferenceParameter() => ScriptConfigurationHelper.ConfigureSettings().Get<DataCreate>();
-
-
-
-
-
+        internal static DataCreate GetConferenceParameter()
+        {
+            return ScriptConfigurationHelper.ConfigureSettings().Get<DataCreate>();
+        }
     }
 }

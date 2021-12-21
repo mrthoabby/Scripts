@@ -1,11 +1,9 @@
 ﻿using ConferencesWebexScript.Entities;
-using ConferencesWebexScript.Interfaces;
 
 namespace ConferencesWebexScript.ApiTemplates
 {
-    internal class ConferenceRequestRecording : ICredentials
+    internal class ConferenceRequestRecording : ConferenceApiCredentials
     {
-        public string Event { get; set; }
-        DataRecording Data_Recording { get; set; }
+        public DataRecording Data_Recording { get; set; }
     }
 }

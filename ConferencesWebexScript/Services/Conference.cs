@@ -17,15 +17,15 @@ namespace ConferencesWebexScript.Services
         /// </summary>
         /// <param name="conferenceRequest"></param>
         /// <returns></returns>
-        public static async Task<(bool IsConferenceCreate, ConferenceResponse ConferenceContent)> CreateConferenceAsync(ConferenceRequestCreate conferenceRequest)
+        public static async Task<(bool IsConferenceCreate, ConferenceResponseCreate ConferenceContent)> CreateConferenceAsync(ConferenceRequestCreate conferenceRequest)
         {
-            using (var _httpClient = new HttpClient())
+            using (HttpClient _httpClient = new HttpClient())
             {
                 conferenceRequest.Event = Enum.GetName(EnumEvents.start);
                 try
                 {
-                    var response = await _httpClient.PostAsJsonAsync(ScriptConfigurationHelper._apiUrl, conferenceRequest);
-                    return response.IsSuccessStatusCode ? (true, JsonSerializer.Deserialize<ConferenceResponse>(await response.Content.ReadAsStringAsync())) : (false, null);
+                    HttpResponseMessage response = await _httpClient.PostAsJsonAsync(ScriptConfigurationHelper._apiUrl, conferenceRequest);
+                    return response.IsSuccessStatusCode ? (true, JsonSerializer.Deserialize<ConferenceResponseCreate>(await response.Content.ReadAsStringAsync())) : (false, null);
 
                 }
                 catch (Exception e)
@@ -40,14 +40,19 @@ namespace ConferencesWebexScript.Services
         //Se espera poder actualizar una conferencia existente cuando la api permita hacerlo
         //public static async Task<bool> UpdateConference(string IdConference) => true;
 
-        public static async Task<(bool IsConferenceRecording, ConferenceResponseRecording ConferenceContent)> StartRecording(ConferenceRequestRecording conferenceRequestRecording)
+        /// <summary>
+        /// Este metodo se encarga de iniciar la grabación de la reunión bajo el id establecido en <seealso cref="_auToken"/>
+        /// </summary>
+        /// <param name="conferenceRequestRecording"></param>
+        /// <returns></returns>
+        /// <exception cref="Exception"></exception>
+        public static async Task<(bool IsConferenceRecording, ConferenceResponseRecording ConferenceContent)> StartRecordingAsync(ConferenceRequestRecording conferenceRequestRecording)
         {
-            using (var _httpClient = new HttpClient())
+            using (HttpClient _httpClient = new HttpClient())
             {
-                conferenceRequestRecording.Event = Enum.GetName(EnumEvents.set_recording);
                 try
                 {
-                    var response = await _httpClient.PostAsJsonAsync(ScriptConfigurationHelper._apiUrl, conferenceRequestRecording);
+                    HttpResponseMessage response = await _httpClient.PostAsJsonAsync(ScriptConfigurationHelper._apiUrl, conferenceRequestRecording);
                     return response.IsSuccessStatusCode ? (true, JsonSerializer.Deserialize<ConferenceResponseRecording>(await response.Content.ReadAsStringAsync())) : (false, null);
 
                 }
