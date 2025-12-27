@@ -146,7 +146,7 @@ read_password() {
 }
 
 collect_credentials() {
-    clear
+    echo ""
     print_header "CONFIGURACIÓN INICIAL DE N8N"
     
     echo -e "${BOLD}Ingresa los datos de configuración:${NC}\n"
@@ -1150,6 +1150,8 @@ EOF
     fi
     
     log_success "Todas las dependencias están instaladas y funcionando"
+    echo ""
+    echo -e "${CYAN}════════════════════════════════════════════════════════${NC}"
     echo ""
     
     # Recolectar credenciales
