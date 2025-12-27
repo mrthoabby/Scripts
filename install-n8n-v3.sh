@@ -923,9 +923,10 @@ create_docker_compose_file() {
     log_step 4 12 "Creando configuración de Docker Compose"
     mkdir -p "$INSTALL_DIR"
     
+    # Generar clave de encriptación ANTES del heredoc para evitar problemas con Docker Compose
+    local encryption_key=$(openssl rand -base64 32)
+    
     cat > "$INSTALL_DIR/docker-compose.yml" << EOF
-version: '3.8'
-
 services:
   postgres:
     image: postgres:15-alpine
@@ -981,7 +982,7 @@ services:
       - NODE_ENV=production
       - WEBHOOK_URL=https://${DOMAIN}/
       - GENERIC_TIMEZONE=${TIMEZONE}
-      - N8N_ENCRYPTION_KEY=$(openssl rand -base64 32)
+      - N8N_ENCRYPTION_KEY=${encryption_key}
       - EXECUTIONS_DATA_PRUNE=true
       - EXECUTIONS_DATA_MAX_AGE=168
       - QUEUE_BULL_REDIS_HOST=redis
@@ -1204,7 +1205,6 @@ EOF
 }
 
 show_final_summary() {
-    clear
     print_box "RESULTADO DE VALIDACIÓN"
     
     local status_icon=""
