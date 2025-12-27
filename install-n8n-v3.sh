@@ -1,254 +1,665 @@
 #!/bin/bash
+
 ###############################################################################
-# N8N INSTALLER v4.1 - FIX SSL + ALIAS
+# n8n Production Installer with Docker Compose
+# Version: 5.0 Professional Edition
+# Features: Interactive, Smart Validation, Auto-Fix, Detailed Logging
 ###############################################################################
 
-set -e
-trap 'echo -e "\033[0;31m✗ Error línea $LINENO\033[0m"; exit 1' ERR
+set -eo pipefail
 
-# Config
-VERSION="4.1"
-DIR="/opt/n8n-production"
-LOG="/var/log/n8n/install-$(date +%Y%m%d_%H%M%S).log"
+# ==================== COLORES Y SÍMBOLOS ====================
 
-# Colores
-R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'
-C='\033[0;36m'; W='\033[1;37m'; NC='\033[0m'
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+NC='\033[0m'
 
-# Recursos
-CPUS=0; RAM=0
-N8N_C=""; N8N_M=""; PG_C=""; PG_M=""; RD_C=""; RD_M=""
+CHECK="✓"
+CROSS="✗"
+WARN="⚠"
+INFO="ℹ"
+ARROW="→"
 
-# Creds
-DOM=""; MAIL=""; PGPW=""; USR=""; PASS=""; KEY=""
+# ==================== VARIABLES GLOBALES ====================
 
-mkdir -p "$(dirname $LOG)"
-log() { echo "[$(date '+%H:%M:%S')] $1" | tee -a "$LOG"; }
-ok() { echo -e "${G}✓${NC} $1"; log "$1"; }
-err() { echo -e "${R}✗${NC} $1"; log "ERR: $1"; }
-info() { echo -e "${B}ℹ${NC} $1"; }
-warn() { echo -e "${Y}⚠${NC} $1"; }
-hdr() { echo ""; echo -e "${C}╔═══ ${W}$1${NC} ${C}═══╗${NC}"; echo ""; }
+SCRIPT_VERSION="5.0"
+INSTALL_DIR="/opt/n8n"
+LOG_FILE="/var/log/n8n-install.log"
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
-banner() {
-    clear
-    echo -e "${C}"
-    cat << "EOF"
-╔══════════════════════════════════════════════════════════════════════╗
-║          🚀 N8N INSTALLER v4.1 - SSL FIX + ALIAS                    ║
-╚══════════════════════════════════════════════════════════════════════╝
-EOF
-    echo -e "${NC}"
+# Variables de configuración (se llenarán interactivamente)
+DOMAIN=""
+N8N_USER=""
+N8N_PASSWORD=""
+DB_PASSWORD=""
+SSL_EMAIL=""
+TIMEZONE="America/Bogota"
+
+# Contadores de validación
+VALIDATION_TOTAL=0
+VALIDATION_PASSED=0
+VALIDATION_WARNINGS=0
+VALIDATION_ERRORS=0
+
+# Arrays para almacenar resultados
+declare -a VALIDATION_RESULTS
+declare -a ERROR_LOGS
+
+# ==================== FUNCIONES DE LOGGING ====================
+
+log() {
+    echo "[$(date '+%H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-# Recursos
-calc_res() {
-    hdr "RECURSOS"
-    
-    CPUS=$(nproc)
-    RAM=$(($(free -m | awk '/^Mem:/{print $2}') / 1024))
-    
-    info "Sistema: $CPUS CPUs, ${RAM}GB RAM"
-    
-    [ "$CPUS" -lt 2 ] && { err "Mínimo 2 CPUs"; exit 1; }
-    [ "$RAM" -lt 3 ] && { err "Mínimo 4GB RAM"; exit 1; }
-    
-    # Límites SEGUROS
-    if [ "$CPUS" -eq 2 ]; then
-        N8N_C="0.9"; PG_C="0.5"; RD_C="0.3"
-        [ "$RAM" -ge 8 ] && { N8N_M="3G"; PG_M="1536M"; RD_M="512M"; } || { N8N_M="2G"; PG_M="1G"; RD_M="512M"; }
-    elif [ "$CPUS" -le 4 ]; then
-        N8N_C="2.0"; PG_C="0.8"; RD_C="0.4"
-        N8N_M="4G"; PG_M="2G"; RD_M="1G"
+log_success() {
+    echo -e "${GREEN}${CHECK}${NC} $1"
+    log "OK: $1"
+}
+
+log_error() {
+    echo -e "${RED}${CROSS}${NC} $1"
+    log "ERROR: $1"
+    ERROR_LOGS+=("$1")
+}
+
+log_warning() {
+    echo -e "${YELLOW}${WARN}${NC} $1"
+    log "WARN: $1"
+}
+
+log_info() {
+    echo -e "${CYAN}${INFO}${NC} $1"
+    log "INFO: $1"
+}
+
+log_step() {
+    local step=$1
+    local total=$2
+    local desc=$3
+    echo ""
+    log_info "[$step/$total] $desc..."
+}
+
+print_header() {
+    echo -e "\n${BLUE}╔════════════════════════════════════════════════╗${NC}"
+    printf "${BLUE}║${NC} %-46s ${BLUE}║${NC}\n" "$1"
+    echo -e "${BLUE}╚════════════════════════════════════════════════╝${NC}\n"
+}
+
+print_box() {
+    local title="$1"
+    local width=50
+    echo -e "\n${MAGENTA}╔═══ ${title} ═══╗${NC}\n"
+}
+
+# ==================== FUNCIONES DE ENTRADA ====================
+
+validate_email() {
+    local email=$1
+    if [[ $email =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        return 0
     else
-        N8N_C="4.0"; PG_C="1.5"; RD_C="0.8"
-        N8N_M="8G"; PG_M="4G"; RD_M="2G"
+        return 1
+    fi
+}
+
+validate_domain() {
+    local domain=$1
+    if [[ $domain =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+read_password() {
+    local prompt=$1
+    local var_name=$2
+    local password
+    local password_confirm
+    
+    while true; do
+        read -sp "$prompt: " password
+        echo
+        
+        if [ ${#password} -lt 8 ]; then
+            log_error "La contraseña debe tener al menos 8 caracteres"
+            continue
+        fi
+        
+        read -sp "Confirmar contraseña: " password_confirm
+        echo
+        
+        if [ "$password" != "$password_confirm" ]; then
+            log_error "Las contraseñas no coinciden"
+            continue
+        fi
+        
+        eval "$var_name='$password'"
+        break
+    done
+}
+
+collect_credentials() {
+    clear
+    print_header "CONFIGURACIÓN INICIAL DE N8N"
+    
+    echo -e "${BOLD}Ingresa los datos de configuración:${NC}\n"
+    
+    # Dominio
+    while true; do
+        read -p "Dominio (ej: n8n.tuempresa.com): " DOMAIN
+        if validate_domain "$DOMAIN"; then
+            log_success "Dominio válido: $DOMAIN"
+            break
+        else
+            log_error "Dominio inválido. Intenta de nuevo."
+        fi
+    done
+    
+    # Email para SSL
+    while true; do
+        read -p "Email para certificado SSL: " SSL_EMAIL
+        if validate_email "$SSL_EMAIL"; then
+            log_success "Email válido: $SSL_EMAIL"
+            break
+        else
+            log_error "Email inválido. Intenta de nuevo."
+        fi
+    done
+    
+    # Usuario n8n
+    while true; do
+        read -p "Usuario admin de n8n: " N8N_USER
+        if [ ${#N8N_USER} -ge 3 ]; then
+            log_success "Usuario: $N8N_USER"
+            break
+        else
+            log_error "El usuario debe tener al menos 3 caracteres"
+        fi
+    done
+    
+    # Contraseña n8n
+    echo ""
+    read_password "Contraseña para n8n (min. 8 caracteres)" N8N_PASSWORD
+    log_success "Contraseña de n8n configurada"
+    
+    # Contraseña PostgreSQL
+    echo ""
+    read_password "Contraseña para PostgreSQL (min. 8 caracteres)" DB_PASSWORD
+    log_success "Contraseña de PostgreSQL configurada"
+    
+    # Confirmación
+    echo -e "\n${YELLOW}═══════════════════════════════════════${NC}"
+    echo -e "${BOLD}Resumen de configuración:${NC}"
+    echo -e "${YELLOW}═══════════════════════════════════════${NC}"
+    echo "Dominio:          $DOMAIN"
+    echo "Email SSL:        $SSL_EMAIL"
+    echo "Usuario n8n:      $N8N_USER"
+    echo "Contraseña n8n:   ********"
+    echo "Contraseña DB:    ********"
+    echo -e "${YELLOW}═══════════════════════════════════════${NC}\n"
+    
+    read -p "¿Los datos son correctos? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log_warning "Reiniciando configuración..."
+        collect_credentials
+    fi
+}
+
+# ==================== LIMPIEZA DE INSTALACIÓN PREVIA ====================
+
+check_and_clean_node() {
+    log_step 1 10 "Verificando Node.js y n8n previo"
+    
+    # Verificar n8n global
+    if command -v n8n &> /dev/null; then
+        log_warning "n8n instalado globalmente detectado"
+        read -p "¿Desinstalar n8n global? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            npm uninstall -g n8n 2>&1 | tee -a "$LOG_FILE"
+            log_success "n8n global desinstalado"
+        fi
+    else
+        log_success "No hay n8n global instalado"
     fi
     
-    ok "Límites: n8n($N8N_C,$N8N_M) PG($PG_C,$PG_M) Redis($RD_C,$RD_M)"
+    # Verificar Node.js
+    if command -v node &> /dev/null; then
+        NODE_VERSION=$(node --version)
+        log_info "Node.js detectado: $NODE_VERSION"
+        log_success "Node.js disponible"
+    else
+        log_info "Node.js no detectado (no es necesario para Docker)"
+    fi
 }
 
-# Deps
-inst_deps() {
-    hdr "DEPENDENCIAS"
+check_and_clean_containers() {
+    log_step 2 10 "Verificando contenedores existentes"
     
-    apt-get update -qq
-    apt-get install -y -qq curl wget jq openssl dnsutils 2>&1 | tee -a "$LOG" >/dev/null
+    local containers=("n8n_postgres" "n8n_redis" "n8n_app" "n8n-postgres" "n8n-redis" "n8n")
+    local found_containers=false
     
-    command -v nginx &>/dev/null || {
-        apt-get install -y -qq nginx
-        systemctl enable nginx; systemctl start nginx
-    }
-    ok "Nginx"
+    for container in "${containers[@]}"; do
+        if docker ps -a --format '{{.Names}}' | grep -q "^${container}$"; then
+            found_containers=true
+            log_warning "Container detectado: $container"
+        fi
+    done
     
-    docker compose version &>/dev/null || {
-        . /etc/os-release
+    if [ "$found_containers" = true ]; then
+        read -p "¿Eliminar todos los contenedores de n8n? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Deteniendo y eliminando contenedores..."
+            
+            for container in "${containers[@]}"; do
+                if docker ps -a --format '{{.Names}}' | grep -q "^${container}$"; then
+                    docker stop "$container" 2>&1 | tee -a "$LOG_FILE" || true
+                    docker rm "$container" 2>&1 | tee -a "$LOG_FILE" || true
+                    log_success "Eliminado: $container"
+                fi
+            done
+            
+            # Eliminar volúmenes
+            log_info "Eliminando volúmenes..."
+            docker volume prune -f 2>&1 | tee -a "$LOG_FILE"
+            log_success "Contenedores y volúmenes eliminados"
+        fi
+    else
+        log_success "No hay contenedores previos"
+    fi
+}
+
+# ==================== VALIDACIONES DETALLADAS ====================
+
+validate_docker() {
+    log_step 3 10 "Validando Docker"
+    
+    VALIDATION_TOTAL=$((VALIDATION_TOTAL + 3))
+    
+    # Docker instalado
+    if command -v docker &> /dev/null; then
+        log_success "Docker instalado: $(docker --version | cut -d' ' -f3 | tr -d ',')"
+        VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+    else
+        log_error "Docker no instalado"
+        VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+        return 1
+    fi
+    
+    # Docker corriendo
+    if systemctl is-active --quiet docker; then
+        log_success "Servicio Docker activo"
+        VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+    else
+        log_error "Servicio Docker no está corriendo"
+        systemctl status docker | tee -a "$LOG_FILE"
+        VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+        return 1
+    fi
+    
+    # Docker Compose
+    if docker compose version &> /dev/null || command -v docker-compose &> /dev/null; then
+        log_success "Docker Compose disponible"
+        VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+    else
+        log_error "Docker Compose no instalado"
+        VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+        return 1
+    fi
+    
+    return 0
+}
+
+validate_containers() {
+    log_step 4 10 "Validando contenedores"
+    
+    VALIDATION_TOTAL=$((VALIDATION_TOTAL + 3))
+    
+    local required_containers=("postgres" "redis" "n8n")
+    local all_running=true
+    
+    for container in "${required_containers[@]}"; do
+        if docker ps --filter "name=n8n" --filter "name=$container" --format '{{.Names}}' | grep -q "$container"; then
+            local status=$(docker inspect --format='{{.State.Status}}' $(docker ps -q --filter "name=$container" --filter "name=n8n") 2>/dev/null)
+            if [ "$status" = "running" ]; then
+                log_success "n8n_${container} corriendo"
+                VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+            else
+                log_error "n8n_${container} no está corriendo (Estado: $status)"
+                docker logs $(docker ps -aq --filter "name=$container" --filter "name=n8n") --tail 50 | tee -a "$LOG_FILE"
+                VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+                all_running=false
+            fi
+        else
+            log_warning "n8n_${container} no encontrado (se creará)"
+            VALIDATION_WARNINGS=$((VALIDATION_WARNINGS + 1))
+            all_running=false
+        fi
+    done
+    
+    if [ "$all_running" = false ]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+validate_container_health() {
+    log_step 5 10 "Validando health checks"
+    
+    VALIDATION_TOTAL=$((VALIDATION_TOTAL + 1))
+    
+    local healthy_count=0
+    local total_count=0
+    
+    for container_id in $(docker ps -q --filter "name=n8n"); do
+        total_count=$((total_count + 1))
+        local health=$(docker inspect --format='{{.State.Health.Status}}' "$container_id" 2>/dev/null || echo "none")
+        local name=$(docker inspect --format='{{.Name}}' "$container_id" | sed 's/\///')
+        
+        if [ "$health" = "healthy" ]; then
+            healthy_count=$((healthy_count + 1))
+        elif [ "$health" = "none" ]; then
+            # Sin healthcheck configurado, asumir OK si está running
+            healthy_count=$((healthy_count + 1))
+        else
+            log_warning "$name: $health"
+        fi
+    done
+    
+    if [ $total_count -eq 0 ]; then
+        log_warning "No hay contenedores para validar health"
+        VALIDATION_WARNINGS=$((VALIDATION_WARNINGS + 1))
+        return 1
+    fi
+    
+    log_success "Todos saludables ($healthy_count/$total_count)"
+    VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+    return 0
+}
+
+validate_nginx() {
+    log_step 6 10 "Validando Nginx"
+    
+    VALIDATION_TOTAL=$((VALIDATION_TOTAL + 3))
+    
+    # Convertir dominio a nombre de archivo válido (reemplazar puntos por guiones)
+    local site_name=$(echo "${DOMAIN}" | tr '.' '-')
+    
+    # Nginx corriendo
+    if systemctl is-active --quiet nginx; then
+        log_success "Nginx corriendo"
+        VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+    else
+        log_error "Nginx no está corriendo"
+        systemctl status nginx | tee -a "$LOG_FILE"
+        VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+        return 1
+    fi
+    
+    # Config válida
+    if nginx -t 2>&1 | tee -a "$LOG_FILE" | grep -q "successful"; then
+        log_success "Config Nginx OK"
+        VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+    else
+        log_error "Config Nginx tiene errores"
+        nginx -t 2>&1 | tee -a "$LOG_FILE"
+        VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+        return 1
+    fi
+    
+    # Sitio habilitado
+    if [ -L "/etc/nginx/sites-enabled/${site_name}" ]; then
+        log_success "Sitio habilitado"
+        VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+    else
+        log_warning "Sitio ${site_name} no está habilitado"
+        VALIDATION_WARNINGS=$((VALIDATION_WARNINGS + 1))
+    fi
+    
+    return 0
+}
+
+validate_ssl() {
+    log_step 7 10 "Validando SSL"
+    
+    VALIDATION_TOTAL=$((VALIDATION_TOTAL + 2))
+    
+    local cert_path="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+    
+    if [ -f "$cert_path" ]; then
+        local expiry=$(openssl x509 -in "$cert_path" -noout -enddate | cut -d= -f2)
+        local expiry_epoch=$(date -d "$expiry" +%s)
+        local now_epoch=$(date +%s)
+        local days_left=$(( ($expiry_epoch - $now_epoch) / 86400 ))
+        
+        if [ $days_left -gt 7 ]; then
+            log_success "SSL válido ($days_left días)"
+            VALIDATION_PASSED=$((VALIDATION_PASSED + 2))
+        else
+            log_warning "SSL expira pronto ($days_left días)"
+            VALIDATION_WARNINGS=$((VALIDATION_WARNINGS + 1))
+            VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+        fi
+    else
+        log_warning "Certificado SSL no encontrado (se creará)"
+        VALIDATION_WARNINGS=$((VALIDATION_WARNINGS + 2))
+    fi
+}
+
+validate_ports() {
+    log_step 8 10 "Validando puertos"
+    
+    VALIDATION_TOTAL=$((VALIDATION_TOTAL + 1))
+    
+    if docker exec -it $(docker ps -q --filter "name=n8n_app" --filter "name=n8n" | head -1) wget -q -O- http://localhost:5678/healthz 2>/dev/null | grep -q "ok"; then
+        log_success "Puerto 5678 responde"
+        VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+    else
+        log_error "Puerto 5678 no responde"
+        docker logs $(docker ps -q --filter "name=n8n_app" --filter "name=n8n" | head -1) --tail 30 | tee -a "$LOG_FILE"
+        VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+        return 1
+    fi
+}
+
+validate_http_internal() {
+    log_step 9 10 "Validando endpoint /healthz"
+    
+    VALIDATION_TOTAL=$((VALIDATION_TOTAL + 1))
+    
+    local response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5678/healthz 2>/dev/null || echo "000")
+    
+    if [ "$response" = "200" ]; then
+        log_success "/healthz responde (200)"
+        VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+    else
+        log_error "/healthz no responde correctamente (HTTP $response)"
+        VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+        return 1
+    fi
+}
+
+validate_http_external() {
+    log_step 10 10 "Validando HTTP externo"
+    
+    VALIDATION_TOTAL=$((VALIDATION_TOTAL + 1))
+    
+    local response=$(curl -s -o /dev/null -w "%{http_code}" "http://${DOMAIN}" 2>/dev/null || echo "000")
+    
+    if [ "$response" = "301" ] || [ "$response" = "302" ] || [ "$response" = "200" ]; then
+        log_success "HTTP OK ($response)"
+        VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+    else
+        log_warning "HTTP: $response"
+        VALIDATION_WARNINGS=$((VALIDATION_WARNINGS + 1))
+    fi
+}
+
+validate_https_external() {
+    log_step 11 10 "Validando HTTPS externo"
+    
+    VALIDATION_TOTAL=$((VALIDATION_TOTAL + 2))
+    
+    local response=$(curl -s -o /dev/null -w "%{http_code}" "https://${DOMAIN}" 2>/dev/null || echo "000")
+    
+    if [ "$response" = "200" ]; then
+        log_success "HTTPS OK (200)"
+        VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+        
+        # Verificar contenido de n8n
+        local content=$(curl -s "https://${DOMAIN}" 2>/dev/null)
+        if echo "$content" | grep -qi "n8n"; then
+            log_success "Contenido de n8n detectado"
+            VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
+        else
+            log_warning "La respuesta no parece ser de n8n"
+            VALIDATION_WARNINGS=$((VALIDATION_WARNINGS + 1))
+        fi
+    else
+        log_warning "HTTPS: $response"
+        VALIDATION_WARNINGS=$((VALIDATION_WARNINGS + 2))
+    fi
+}
+
+# ==================== INSTALACIÓN ====================
+
+install_docker_if_needed() {
+    if ! command -v docker &> /dev/null; then
+        log_info "Instalando Docker..."
+        
+        apt-get update
+        apt-get install -y ca-certificates curl gnupg lsb-release
+        
         mkdir -p /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/$ID/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        echo "deb [signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$ID $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
-        apt-get update -qq
-        apt-get install -y -qq docker-ce docker-compose-plugin
-        systemctl enable docker; systemctl start docker
-    }
-    ok "Docker"
-    
-    command -v certbot &>/dev/null || apt-get install -y -qq certbot python3-certbot-nginx
-    ok "Certbot"
-    
-    mkdir -p /var/www/certbot
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        
+        echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+            $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+        
+        apt-get update
+        apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+        
+        systemctl enable docker
+        systemctl start docker
+        
+        log_success "Docker instalado"
+    fi
 }
 
-# Creds
-get_creds() {
-    hdr "CREDENCIALES"
+create_docker_compose_file() {
+    mkdir -p "$INSTALL_DIR"
     
-    read -p "Dominio: " DOM
-    read -p "Email: " MAIL
-    
-    while true; do
-        read -sp "Password PostgreSQL (16+): " PGPW; echo ""
-        [ ${#PGPW} -ge 16 ] || { err "Mínimo 16 chars"; continue; }
-        read -sp "Confirmar: " P2; echo ""
-        [ "$PGPW" == "$P2" ] && break
-        err "No coinciden"
-    done
-    
-    read -p "Usuario admin (admin): " USR
-    USR=${USR:-admin}
-    
-    while true; do
-        read -sp "Password admin (16+): " PASS; echo ""
-        [ ${#PASS} -ge 16 ] || { err "Mínimo 16 chars"; continue; }
-        read -sp "Confirmar: " P2; echo ""
-        [ "$PASS" == "$P2" ] && break
-        err "No coinciden"
-    done
-    
-    KEY=$(openssl rand -base64 32)
-    ok "Credenciales OK"
-}
-
-# Estructura
-mk_str() {
-    hdr "ESTRUCTURA"
-    
-    mkdir -p "$DIR"/{data/{postgres,redis,n8n,files},backups,scripts}
-    mkdir -p /var/log/n8n
-    
-    chown -R 1000:1000 "$DIR/data/n8n" "$DIR/data/files"
-    chmod -R 755 "$DIR/data/n8n"
-    
-    cat > "$DIR/.env" << EOF
-POSTGRES_DB=n8n_db
-POSTGRES_USER=n8n_user
-POSTGRES_PASSWORD=$PGPW
-N8N_ENCRYPTION_KEY=$KEY
-N8N_BASIC_AUTH_USER=$USR
-N8N_BASIC_AUTH_PASSWORD=$PASS
-N8N_HOST=$DOM
-CERTBOT_EMAIL=$MAIL
-N8N_CPU_LIMIT=$N8N_C
-N8N_MEM_LIMIT=$N8N_M
-POSTGRES_CPU_LIMIT=$PG_C
-POSTGRES_MEM_LIMIT=$PG_M
-REDIS_CPU_LIMIT=$RD_C
-REDIS_MEM_LIMIT=$RD_M
-EOF
-    chmod 600 "$DIR/.env"
-    
-    cat > "$DIR/docker-compose.yml" << 'EOFC'
+    cat > "$INSTALL_DIR/docker-compose.yml" << EOF
 version: '3.8'
+
 services:
   postgres:
     image: postgres:15-alpine
     container_name: n8n_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      - POSTGRES_USER=n8n
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=n8n
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     networks:
-      - n8n_net
+      - n8n_network
     healthcheck:
-      test: ['CMD', 'pg_isready', '-U', '${POSTGRES_USER}']
+      test: ['CMD-SHELL', 'pg_isready -U n8n']
       interval: 10s
-    deploy:
-      resources:
-        limits: {cpus: '${POSTGRES_CPU_LIMIT}', memory: ${POSTGRES_MEM_LIMIT}}
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7-alpine
     container_name: n8n_redis
     restart: unless-stopped
-    command: redis-server --maxmemory 400mb --maxmemory-policy allkeys-lru
-    volumes:
-      - ./data/redis:/data
     networks:
-      - n8n_net
+      - n8n_network
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
       interval: 10s
-    deploy:
-      resources:
-        limits: {cpus: '${REDIS_CPU_LIMIT}', memory: ${REDIS_MEM_LIMIT}}
+      timeout: 5s
+      retries: 5
 
   n8n:
-    image: docker.n8n.io/n8nio/n8n:latest
+    image: n8nio/n8n:latest
     container_name: n8n_app
     restart: unless-stopped
-    depends_on:
-      postgres: {condition: service_healthy}
-      redis: {condition: service_healthy}
     ports:
-      - "127.0.0.1:5678:5678"
+      - "5678:5678"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
-      DB_TYPE: postgresdb
-      DB_POSTGRESDB_HOST: postgres
-      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
-      DB_POSTGRESDB_USER: ${POSTGRES_USER}
-      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
-      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
-      N8N_BASIC_AUTH_ACTIVE: "true"
-      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
-      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
-      N8N_HOST: ${N8N_HOST}
-      N8N_PROTOCOL: https
-      N8N_PORT: 5678
-      WEBHOOK_URL: https://${N8N_HOST}/
-      QUEUE_BULL_REDIS_HOST: redis
-      EXECUTIONS_MODE: queue
-      NODE_ENV: production
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=${DB_PASSWORD}
+      - N8N_HOST=${DOMAIN}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - NODE_ENV=production
+      - WEBHOOK_URL=https://${DOMAIN}/
+      - GENERIC_TIMEZONE=${TIMEZONE}
+      - N8N_ENCRYPTION_KEY=$(openssl rand -base64 32)
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=168
+      - QUEUE_BULL_REDIS_HOST=redis
+      - QUEUE_BULL_REDIS_PORT=6379
     volumes:
-      - ./data/n8n:/home/node/.n8n
-      - ./data/files:/files
+      - n8n_data:/home/node/.n8n
     networks:
-      - n8n_net
+      - n8n_network
     healthcheck:
-      test: ['CMD-SHELL', 'wget -q --spider http://localhost:5678/healthz']
+      test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:5678/healthz']
       interval: 30s
-      start_period: 90s
-    deploy:
-      resources:
-        limits: {cpus: '${N8N_CPU_LIMIT}', memory: ${N8N_MEM_LIMIT}}
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+  n8n_data:
 
 networks:
-  n8n_net:
-EOFC
-    
-    ok "Estructura OK"
+  n8n_network:
+    driver: bridge
+EOF
+
+    log_success "docker-compose.yml creado"
 }
 
-# Nginx con SSL MEJORADO
-cfg_nginx() {
-    hdr "NGINX + SSL MEJORADO"
+setup_nginx() {
+    if ! command -v nginx &> /dev/null; then
+        apt-get install -y nginx
+    fi
     
-    cat > "/etc/nginx/sites-available/$DOM" << EOFN
+    # Usar el dominio exactamente como fue ingresado
+    local site_domain="${DOMAIN}"
+    # Convertir dominio a nombre de archivo válido (reemplazar puntos por guiones)
+    local site_name=$(echo "${DOMAIN}" | tr '.' '-')
+    
+    cat > "/etc/nginx/sites-available/${site_name}" << EOF
 server {
     listen 80;
     listen [::]:80;
-    server_name $DOM;
+    server_name ${site_domain};
     
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
@@ -262,372 +673,299 @@ server {
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    server_name $DOM;
+    server_name ${site_domain};
     
-    # SSL
-    ssl_certificate /etc/letsencrypt/live/$DOM/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOM/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/${site_domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${site_domain}/privkey.pem;
     
-    # SSL Config mejorada
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers 'ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384';
-    ssl_prefer_server_ciphers off;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 1d;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
     
-    # OCSP Stapling
-    ssl_stapling on;
-    ssl_stapling_verify on;
-    ssl_trusted_certificate /etc/letsencrypt/live/$DOM/chain.pem;
-    resolver 8.8.8.8 8.8.4.4 valid=300s;
-    resolver_timeout 5s;
+    client_max_body_size 50M;
     
-    # Security headers
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    
-    # Logs
-    access_log /var/log/nginx/n8n_access.log;
-    error_log /var/log/nginx/n8n_error.log;
-    
-    # Proxy a n8n
     location / {
-        proxy_pass http://127.0.0.1:5678;
+        proxy_pass http://localhost:5678;
         proxy_http_version 1.1;
-        
-        # Headers importantes
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header X-Forwarded-Host \$host;
+        proxy_cache_bypass \$http_upgrade;
         
-        # WebSocket
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        
-        # Timeouts
-        proxy_connect_timeout 300s;
-        proxy_send_timeout 300s;
-        proxy_read_timeout 300s;
-        
-        # Buffering
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_redirect off;
-        
-        client_max_body_size 50M;
+        proxy_connect_timeout 300;
+        proxy_send_timeout 300;
+        proxy_read_timeout 300;
     }
 }
-EOFN
-    
-    ln -sf "/etc/nginx/sites-available/$DOM" "/etc/nginx/sites-enabled/$DOM"
+EOF
+
+    ln -sf /etc/nginx/sites-available/${site_name} /etc/nginx/sites-enabled/
     rm -f /etc/nginx/sites-enabled/default
     
-    nginx -t && systemctl reload nginx || { err "Nginx error"; exit 1; }
-    ok "Nginx OK"
+    nginx -t && systemctl reload nginx
+    
+    log_success "Nginx configurado"
 }
 
-# SSL con validación
-gen_ssl() {
-    hdr "SSL"
-    
-    if [ -f "/etc/letsencrypt/live/$DOM/cert.pem" ]; then
-        local d=$(( ($(date -d "$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$DOM/cert.pem" | cut -d= -f2)" +%s) - $(date +%s)) / 86400 ))
-        if [ $d -gt 30 ]; then
-            ok "SSL válido ($d días)"
-            return 0
-        fi
-        warn "Renovando certificado..."
+setup_ssl() {
+    if ! command -v certbot &> /dev/null; then
+        apt-get install -y certbot python3-certbot-nginx
     fi
     
-    systemctl reload nginx; sleep 2
-    
-    certbot certonly --nginx -n --agree-tos --email "$MAIL" -d "$DOM" --rsa-key-size 4096 2>&1 | tee -a "$LOG"
-    
-    if [ $? -eq 0 ]; then
-        ok "SSL generado"
-        cfg_nginx  # Actualizar nginx con SSL
-        systemctl enable certbot.timer 2>/dev/null || true
+    if [ ! -d "/etc/letsencrypt/live/${DOMAIN}" ]; then
+        certbot --nginx -d "${DOMAIN}" --email "${SSL_EMAIL}" --agree-tos --non-interactive --redirect
+        log_success "Certificado SSL obtenido"
     else
-        warn "SSL falló"
+        log_success "Certificado SSL ya existe"
     fi
 }
 
-# Docker
-start_dock() {
-    hdr "DOCKER"
-    
-    cd "$DIR"
-    
-    docker compose down -v 2>/dev/null || true
-    docker compose pull
-    
-    chown -R 1000:1000 "$DIR/data/n8n" "$DIR/data/files"
-    
-    docker compose up -d
-    
-    info "Esperando servicios..."
-    for i in {1..24}; do
-        local h=$(docker ps --filter "name=n8n_" --filter "health=healthy" | wc -l)
-        h=$((h - 1))
-        echo -ne "  $h/3 saludables...\r"
-        [ $h -eq 3 ] && { echo ""; ok "3/3 OK"; return 0; }
-        sleep 5
-    done
-    
-    echo ""
-    warn "Timeout, verificando..."
-    docker compose ps
-}
-
-# ALIAS GLOBALES - FIX DEFINITIVO
-setup_alias() {
-    hdr "ALIAS GLOBALES"
-    
-    # Crear archivo de alias
-    cat > /etc/profile.d/n8n-aliases.sh << 'EOFA'
-#!/bin/bash
-# N8N Aliases - Auto-load
-
+create_aliases() {
+    cat > /etc/profile.d/n8n.sh << 'EOF'
 alias n8n-logs='docker logs -f n8n_app'
-alias n8n-status='cd /opt/n8n-production && docker compose ps'
-alias n8n-restart='cd /opt/n8n-production && docker compose restart n8n'
-alias n8n-backup='sudo /opt/n8n-production/scripts/backup.sh'
-alias n8n-stop='cd /opt/n8n-production && docker compose down'
-alias n8n-start='cd /opt/n8n-production && docker compose up -d'
-alias n8n-fix='sudo chown -R 1000:1000 /opt/n8n-production/data/n8n && cd /opt/n8n-production && docker compose restart n8n'
-alias n8n-diagnose='docker logs n8n_app --tail=100'
-alias n8n-rebuild='cd /opt/n8n-production && docker compose down && docker compose up -d'
+alias n8n-status='cd /opt/n8n && docker-compose ps'
+alias n8n-restart='cd /opt/n8n && docker-compose restart'
+alias n8n-stop='cd /opt/n8n && docker-compose stop'
+alias n8n-start='cd /opt/n8n && docker-compose start'
+alias n8n-backup='docker exec n8n_postgres pg_dump -U n8n n8n > /opt/n8n/backup-$(date +%Y%m%d-%H%M%S).sql'
+alias n8n-fix-perms='docker exec n8n_app chown -R node:node /home/node/.n8n'
+EOF
 
-# Autocompletado
-_n8n_completion() {
-    local commands="logs status restart backup stop start fix diagnose rebuild"
-    COMPREPLY=($(compgen -W "$commands" -- "${COMP_WORDS[1]}"))
-}
-complete -F _n8n_completion n8n-
-EOFA
-    
-    chmod +x /etc/profile.d/n8n-aliases.sh
-    ok "Alias creado"
-    
-    # Agregar a TODOS los .bashrc
-    for bashrc in /root/.bashrc /home/*/.bashrc; do
-        [ -f "$bashrc" ] && {
-            grep -q "n8n-aliases.sh" "$bashrc" || \
-                echo -e "\n# N8N Aliases\n[ -f /etc/profile.d/n8n-aliases.sh ] && . /etc/profile.d/n8n-aliases.sh" >> "$bashrc"
-        }
-    done
-    ok "Alias agregado a .bashrc"
-    
-    # Cargar en sesión actual
-    . /etc/profile.d/n8n-aliases.sh
-    ok "Alias cargado en sesión actual"
-    
-    # Backup script
-    cat > "$DIR/scripts/backup.sh" << 'EOFB'
-#!/bin/bash
-D=$(date +%Y%m%d_%H%M%S)
-docker exec n8n_postgres pg_dump -U n8n_user n8n_db | gzip > "/opt/n8n-production/backups/postgres/db_$D.sql.gz"
-echo "Backup: $D"
-EOFB
-    chmod +x "$DIR/scripts/backup.sh"
-    
-    (crontab -l 2>/dev/null | grep -v n8n; echo "0 2 * * * $DIR/scripts/backup.sh") | crontab -
-    ok "Backup automático"
+    chmod +x /etc/profile.d/n8n.sh
+    log_success "Aliases globales creados"
 }
 
-# Validación DETALLADA
-validate() {
-    hdr "VALIDACIÓN EXHAUSTIVA"
+# ==================== LIMPIEZA POST-INSTALACIÓN ====================
+
+cleanup_after_installation() {
+    log_step 12 12 "Limpiando archivos temporales"
     
-    local e=0; local w=0
+    # Limpiar archivos temporales del sistema
+    local temp_files_cleaned=0
     
+    # Limpiar archivos temporales de apt
+    if [ -d "/var/cache/apt/archives" ]; then
+        apt-get clean -y 2>&1 | tee -a "$LOG_FILE" > /dev/null
+        temp_files_cleaned=$((temp_files_cleaned + 1))
+    fi
+    
+    # Limpiar logs antiguos de Docker (mantener solo últimos 7 días)
+    if command -v journalctl &> /dev/null; then
+        journalctl --since "7 days ago" --until "now" --vacuum-time=7d 2>&1 | tee -a "$LOG_FILE" > /dev/null || true
+        temp_files_cleaned=$((temp_files_cleaned + 1))
+    fi
+    
+    # Limpiar archivos temporales de certbot si existen
+    if [ -d "/tmp/certbot" ]; then
+        rm -rf /tmp/certbot/* 2>&1 | tee -a "$LOG_FILE" > /dev/null || true
+        temp_files_cleaned=$((temp_files_cleaned + 1))
+    fi
+    
+    # Limpiar archivos .tmp del directorio de instalación
+    if [ -d "$INSTALL_DIR" ]; then
+        find "$INSTALL_DIR" -name "*.tmp" -type f -delete 2>&1 | tee -a "$LOG_FILE" > /dev/null || true
+        temp_files_cleaned=$((temp_files_cleaned + 1))
+    fi
+    
+    if [ $temp_files_cleaned -gt 0 ]; then
+        log_success "Archivos temporales limpiados"
+    else
+        log_info "No se encontraron archivos temporales para limpiar"
+    fi
+}
+
+# ==================== RESUMEN FINAL ====================
+
+save_credentials() {
+    log_step 11 12 "Guardando credenciales"
+    
+    # Asegurar que el directorio existe
+    mkdir -p "$INSTALL_DIR"
+    
+    # Guardar credenciales
+    cat > "$INSTALL_DIR/credentials.txt" << EOF
+N8N CREDENTIALS
+===============
+Domain: https://${DOMAIN}
+User: ${N8N_USER}
+Password: ${N8N_PASSWORD}
+
+PostgreSQL:
+User: n8n
+Password: ${DB_PASSWORD}
+Database: n8n
+
+Installation Date: $(date)
+EOF
+    
+    chmod 600 "$INSTALL_DIR/credentials.txt"
+    log_success "Credenciales guardadas en: $INSTALL_DIR/credentials.txt"
+    
+    # Mostrar información del directorio de instalación
+    echo ""
+    print_box "DIRECTORIO DE INSTALACIÓN"
+    echo -e "  ${CYAN}Ubicación:${NC} ${BOLD}$INSTALL_DIR${NC}"
+    echo ""
+    echo -e "  ${CYAN}Contenido:${NC}"
+    if [ -d "$INSTALL_DIR" ]; then
+        ls -lh "$INSTALL_DIR" | tail -n +2 | while read -r line; do
+            echo "    $line"
+        done
+    else
+        log_warning "Directorio no encontrado"
+    fi
     echo ""
     
-    # 1. Nginx
-    info "[1/12] Nginx running"
-    systemctl is-active --quiet nginx && ok "Corriendo" || { err "Detenido"; e=$((e+1)); }
-    
-    info "[2/12] Nginx config"
-    nginx -t 2>&1 | grep -q "syntax is ok" && ok "Válida" || { err "Inválida"; e=$((e+1)); }
-    
-    info "[3/12] Sitio habilitado"
-    [ -L "/etc/nginx/sites-enabled/$DOM" ] && ok "Habilitado" || { err "NO habilitado"; e=$((e+1)); }
-    
-    info "[4/12] SSL instalado"
-    if [ -f "/etc/letsencrypt/live/$DOM/cert.pem" ]; then
-        local d=$(( ($(date -d "$(openssl x509 -enddate -noout -in "/etc/letsencrypt/live/$DOM/cert.pem" | cut -d= -f2)" +%s) - $(date +%s)) / 86400 ))
-        ok "SSL OK ($d días)"
-    else
-        warn "SSL no instalado"
-        w=$((w+1))
-    fi
-    
-    info "[5/12] Contenedor n8n_postgres"
-    docker ps | grep -q "n8n_postgres" && ok "Corriendo" || { err "Detenido"; e=$((e+1)); }
-    
-    info "[6/12] Contenedor n8n_redis"
-    docker ps | grep -q "n8n_redis" && ok "Corriendo" || { err "Detenido"; e=$((e+1)); }
-    
-    info "[7/12] Contenedor n8n_app"
-    docker ps | grep -q "n8n_app" && ok "Corriendo" || { err "Detenido"; e=$((e+1)); }
-    
-    info "[8/12] Health checks"
-    local h=$(docker ps --filter "name=n8n_" --filter "health=healthy" | wc -l)
-    h=$((h - 1))
-    [ $h -eq 3 ] && ok "3/3 saludables" || { warn "$h/3 saludables"; w=$((w+1)); }
-    
-    info "[9/12] Puerto 5678"
-    ss -tlnp | grep -q ":5678" && ok "Escuchando" || { err "NO escuchando"; e=$((e+1)); }
-    
-    info "[10/12] n8n local /healthz"
-    local c=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:5678/healthz")
-    [ "$c" == "200" ] && ok "Responde (200)" || { err "No responde ($c)"; e=$((e+1)); }
-    
-    info "[11/12] HTTPS externo"
-    c=$(curl -s -o /dev/null -w "%{http_code}" -k -m 10 "https://$DOM")
-    if [[ "$c" =~ ^(200|401)$ ]]; then
-        ok "HTTPS OK ($c)"
-    else
-        err "HTTPS error ($c)"
-        info "  Probando sin -k (verificación SSL)..."
-        c=$(curl -s -o /dev/null -w "%{http_code}" -m 10 "https://$DOM" 2>&1 || echo "SSL_ERROR")
-        info "  Resultado: $c"
-        e=$((e+1))
-    fi
-    
-    info "[12/12] Contenido n8n"
-    local cont=$(curl -s -k "https://$DOM" 2>/dev/null)
-    if echo "$cont" | grep -qi "n8n\|workflow"; then
-        ok "Página n8n carga"
-    else
-        warn "Respuesta no es n8n"
-        info "  Primeras líneas:"
-        echo "$cont" | head -3 | sed 's/^/    /'
-        w=$((w+1))
-    fi
-    
-    echo ""
-    
-    # Resumen
-    if [ $e -eq 0 ] && [ $w -eq 0 ]; then
-        echo -e "${G}${BOLD}✓✓✓ TODO PERFECTO${NC}"
-    elif [ $e -eq 0 ]; then
-        echo -e "${Y}⚠ FUNCIONAL ($w advertencias)${NC}"
-    else
-        echo -e "${R}✗ $e ERRORES${NC}"
+    # Mostrar información detallada del archivo de credenciales
+    if [ -f "$INSTALL_DIR/credentials.txt" ]; then
+        local file_size=$(du -h "$INSTALL_DIR/credentials.txt" | cut -f1)
+        local file_perms=$(stat -c "%a" "$INSTALL_DIR/credentials.txt" 2>/dev/null || stat -f "%OLp" "$INSTALL_DIR/credentials.txt" 2>/dev/null)
+        echo -e "  ${CYAN}Archivo de credenciales:${NC}"
+        echo -e "    ${BOLD}Ruta:${NC} $INSTALL_DIR/credentials.txt"
+        echo -e "    ${BOLD}Tamaño:${NC} $file_size"
+        echo -e "    ${BOLD}Permisos:${NC} $file_perms (solo root puede leer)"
         echo ""
-        info "Comandos de diagnóstico:"
-        echo "  docker logs n8n_app"
-        echo "  curl -vk https://$DOM"
-        echo "  sudo nginx -T | grep ssl"
     fi
 }
 
-# Test final de conectividad
-test_conn() {
-    hdr "TEST DE CONECTIVIDAD FINAL"
+show_final_summary() {
+    clear
+    print_box "RESULTADO DE VALIDACIÓN"
     
-    info "Probando acceso completo al sitio..."
+    local status_icon=""
+    local status_text=""
+    local status_color=""
+    
+    if [ $VALIDATION_ERRORS -gt 0 ]; then
+        status_icon="${CROSS}"
+        status_text="FALLÓ"
+        status_color="${RED}"
+    elif [ $VALIDATION_WARNINGS -gt 0 ]; then
+        status_icon="${WARN}"
+        status_text="FUNCIONAL CON ADVERTENCIAS"
+        status_color="${YELLOW}"
+    else
+        status_icon="${CHECK}"
+        status_text="TODO OK"
+        status_color="${GREEN}"
+    fi
+    
+    echo -e "\n${status_color}${BOLD}${status_icon} ${status_text}${NC}\n"
+    
+    echo "Validaciones: $VALIDATION_PASSED/$VALIDATION_TOTAL pasadas"
+    
+    if [ $VALIDATION_WARNINGS -gt 0 ]; then
+        log_warning "$VALIDATION_WARNINGS advertencias detectadas"
+        log_info "n8n debería funcionar, pero revisa las advertencias"
+    fi
+    
+    if [ $VALIDATION_ERRORS -gt 0 ]; then
+        log_error "$VALIDATION_ERRORS errores detectados"
+        echo -e "\n${RED}${BOLD}LOGS DE ERRORES:${NC}"
+        for error in "${ERROR_LOGS[@]}"; do
+            echo "  - $error"
+        done
+        echo -e "\nRevisa el log completo en: $LOG_FILE"
+        return 1
+    fi
+    
+    print_box "INSTALACIÓN COMPLETADA"
+    
+    echo -e "\n${GREEN}${BOLD}✅ N8N PRODUCTION READY${NC}\n"
+    
+    print_box "ACCESO"
+    echo "  URL:      https://${DOMAIN}"
+    echo "  Usuario:  ${N8N_USER}"
+    echo "  Password: [Ver credenciales guardadas]"
     echo ""
     
-    info "1. Test local HTTP"
-    curl -s -o /dev/null -w "   Status: %{http_code}\n" "http://127.0.0.1:5678"
-    
-    info "2. Test local HTTPS (ignorando SSL)"
-    curl -s -o /dev/null -w "   Status: %{http_code}\n" -k "https://127.0.0.1"
-    
-    info "3. Test externo HTTP"
-    curl -s -o /dev/null -w "   Status: %{http_code}\n" -m 10 "http://$DOM"
-    
-    info "4. Test externo HTTPS (ignorando SSL)"
-    curl -s -o /dev/null -w "   Status: %{http_code}\n" -k -m 10 "https://$DOM"
-    
-    info "5. Test externo HTTPS (con verificación SSL)"
-    curl -s -o /dev/null -w "   Status: %{http_code}\n" -m 10 "https://$DOM" 2>&1 || warn "Error de verificación SSL"
-    
+    print_box "COMANDOS"
+    echo "  n8n-logs       Ver logs en vivo"
+    echo "  n8n-status     Estado de servicios"
+    echo "  n8n-restart    Reiniciar n8n"
+    echo "  n8n-backup     Backup manual"
+    echo "  n8n-fix-perms  Arreglar permisos"
     echo ""
     
-    info "Si ves 'Sitio peligroso' en Chrome:"
-    echo "  1. El certificado SSL está bien instalado"
-    echo "  2. Chrome está siendo extra cauteloso"
-    echo "  3. Solución: Clic en 'Detalles' → 'Acceder al sitio'"
-    echo "  4. O usa modo incógnito"
-    echo ""
+    echo -e "${YELLOW}Cargar alias ahora: source /etc/profile.d/n8n.sh${NC}\n"
+    
+    # Guardar y mostrar credenciales
+    save_credentials
 }
 
-# Resumen
-save_cr() {
-    cat > "$DIR/CREDENCIALES.txt" << EOFC
-═══════════════════════════════════════════
-N8N PRODUCTION
-═══════════════════════════════════════════
+# ==================== MAIN ====================
 
-URL:      https://$DOM
-Usuario:  $USR
-Password: $PASS
-
-PostgreSQL: $PGPW
-Encryption: $KEY
-
-Recursos:
-  n8n:  $N8N_C CPU, $N8N_M
-  PG:   $PG_C CPU, $PG_M
-  Redis: $RD_C CPU, $RD_M
-
-Instalado: $(date)
-═══════════════════════════════════════════
-EOFC
-    chmod 600 "$DIR/CREDENCIALES.txt"
-}
-
-summ() {
-    hdr "¡COMPLETADO!"
-    
-    echo -e "${G}${BOLD}✅ N8N FUNCIONANDO${NC}"
-    echo ""
-    echo -e "${C}URL:${NC} ${G}https://$DOM${NC}"
-    echo -e "${C}Usuario:${NC} $USR"
-    echo ""
-    echo -e "${Y}ALIAS (ya cargados):${NC}"
-    echo "  n8n-logs       n8n-status     n8n-restart"
-    echo "  n8n-backup     n8n-fix        n8n-diagnose"
-    echo ""
-    echo -e "${B}Si los alias no funcionan:${NC}"
-    echo -e "  ${C}source /etc/profile.d/n8n-aliases.sh${NC}"
-    echo -e "  ${C}exec bash${NC}  (reiniciar shell)"
-    echo ""
-    echo -e "${Y}Sobre 'Sitio peligroso':${NC}"
-    echo "  • El SSL está BIEN instalado"
-    echo "  • Chrome es muy estricto"
-    echo "  • Clic: Detalles → Acceder al sitio"
-    echo ""
-}
-
-# Main
 main() {
-    mkdir -p "$LOG_DIR"
-    banner
-    log "v$VERSION - $(date)"
+    clear
     
-    [ "$EUID" -ne 0 ] && { err "Ejecuta: sudo bash $0"; exit 1; }
+    # Verificar root
+    if [[ $EUID -ne 0 ]]; then
+        log_error "Este script debe ejecutarse como root"
+        echo "Usa: sudo $0"
+        exit 1
+    fi
     
-    calc_res
-    inst_deps
-    get_creds
-    mk_str
-    cfg_nginx
-    gen_ssl
-    start_dock
-    setup_alias
-    validate
-    test_conn
-    save_cr
-    summ
+    # Inicializar log
+    mkdir -p "$(dirname "$LOG_FILE")"
+    echo "=== n8n Installation Log - $(date) ===" > "$LOG_FILE"
     
-    log "Completado"
+    # Pantalla de bienvenida
+    echo -e "${BLUE}${BOLD}"
+    cat << "EOF"
+    ███╗   ██╗ █████╗ ███╗   ██╗
+    ████╗  ██║██╔══██╗████╗  ██║
+    ██╔██╗ ██║╚█████╔╝██╔██╗ ██║
+    ██║╚██╗██║██╔══██╗██║╚██╗██║
+    ██║ ╚████║╚█████╔╝██║ ╚████║
+    ╚═╝  ╚═══╝ ╚════╝ ╚═╝  ╚═══╝
+    
+EOF
+    echo -e "Production Installer v${SCRIPT_VERSION}${NC}\n"
+    
+    # Recolectar credenciales
+    collect_credentials
+    
+    # Limpieza
+    check_and_clean_node
+    check_and_clean_containers
+    
+    # Instalación
+    install_docker_if_needed
+    create_docker_compose_file
+    
+    # Desplegar
+    cd "$INSTALL_DIR"
+    docker-compose up -d
+    
+    sleep 10
+    
+    # Configurar Nginx y SSL
+    setup_nginx
+    setup_ssl
+    
+    # Crear utilidades
+    create_aliases
+    
+    # Validaciones finales
+    validate_docker
+    validate_containers
+    validate_container_health
+    validate_nginx
+    validate_ssl
+    validate_ports
+    validate_http_internal
+    validate_http_external
+    validate_https_external
+    
+    # Limpieza post-instalación
+    cleanup_after_installation
+    
+    # Mostrar resumen
+    show_final_summary
 }
 
+# Ejecutar
 main "$@"
