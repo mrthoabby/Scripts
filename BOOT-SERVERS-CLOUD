@@ -1,0 +1,83 @@
+# Re-analizar para obtener datos actualizados
+ALL_SITES=()
+SITES_WITH_SSL=()
+SITES_WITHOUT_SSL=()
+SITES_CRITICAL=()
+SITES_WARNING=()
+declare -A SITE_INFO_NEW
+
+for site_file in "$SITES_AVAILABLE"/*; do
+    [ -e "$site_file" ] || continue
+    [ -f "$site_file" ] || continue
+    
+    local site_name=$(basename "$site_file")
+    
+    [[ "$site_name" == "default" ]] && continue
+    [[ "$site_name" == "default-ssl" ]] && continue
+    [[ "$site_name" =~ \. ]] && [[ "$site_name" =~ (bak|old|disabled)$ ]] && continue
+    
+    ALL_SITES+=("$site_name")
+    analyze_site "$site_name" "$site_file"
+done
+
+# Mostrar estadísticas
+local total=${#ALL_SITES[@]}
+local with_ssl=${#SITES_WITH_SSL[@]}
+local without_ssl=${#SITES_WITHOUT_SSL[@]}
+local critical=${#SITES_CRITICAL[@]}
+local warning=${#SITES_WARNING[@]}
+local percent=0
+
+[ $total -gt 0 ] && percent=$((with_ssl * 100 / total))
+
+echo ""
+echo -e "${WHITE}╔════════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${WHITE}║  RESUMEN GENERAL DE CONFIGURACIÓN SSL                          ║${NC}"
+echo -e "${WHITE}╠════════════════════════════════════════════════════════════════╣${NC}"
+echo -e "${WHITE}║${NC}  Total de sitios:              ${CYAN}$total${NC}"
+echo -e "${WHITE}║${NC}  Con SSL:                      ${GREEN}$with_ssl${NC}"
+echo -e "${WHITE}║${NC}  Sin SSL:                      ${YELLOW}$without_ssl${NC}"
+echo -e "${WHITE}║${NC}  Cobertura SSL:                ${CYAN}$percent%${NC}"
+echo -e "${WHITE}║${NC}"
+echo -e "${WHITE}║${NC}  Certificados críticos (< 10d): ${RED}$critical${NC}"
+echo -e "${WHITE}║${NC}  Certificados advertencia (<30d): ${YELLOW}$warning${NC}"
+echo -e "${WHITE}║${NC}"
+
+if [ "${SITE_INFO[auto_renewal_systemd]}" == "SÍ" ]; then
+    echo -e "${WHITE}║${NC}  Renovación automática:        ${GREEN}✓ ACTIVA (systemd)${NC}"
+elif [ "${SITE_INFO[auto_renewal_cron]}" == "SÍ" ]; then
+    echo -e "${WHITE}║${NC}  Renovación automática:        ${GREEN}✓ ACTIVA (cron)${NC}"
+else
+    echo -e "${WHITE}║${NC}  Renovación automática:        ${RED}✗ NO CONFIGURADA${NC}"
+fi
+
+echo -e "${WHITE}║${NC}"
+echo -e "${WHITE}║${NC}  IP del servidor:              ${MAGENTA}$SERVER_IP${NC}"
+echo -e "${WHITE}║${NC}  Log guardado en:"
+echo -e "${WHITE}║${NC}    ${CYAN}$LOG_FILE${NC}"
+echo -e "${WHITE}╚════════════════════════════════════════════════════════════════╝${NC}"
+echo ""
+
+# Recomendaciones
+if [ $critical -gt 0 ]; then
+    print_error "⚠️  URGENTE: Hay $critical certificados críticos (< 10 días)"
+    print_error "Renuévalos inmediatamente para evitar caídas de servicio"
+    echo ""
+fi
+
+if [ $without_ssl -gt 0 ]; then
+    print_warning "RECOMENDACIÓN: Aún hay $without_ssl sitios sin SSL"
+    print_info "Ejecuta este script nuevamente para configurarlos"
+    echo ""
+fi
+
+if [ "${SITE_INFO[auto_renewal_systemd]}" == "NO" ] && [ "${SITE_INFO[auto_renewal_cron]}" == "NO" ]; then
+    print_error "⚠️  URGENTE: No tienes renovación automática configurada"
+    print_error "Tus certificados expirarán en 90 días y causarán caídas de servicio"
+    print_info "Ejecuta: systemctl enable certbot.timer && systemctl start certbot.timer"
+    echo ""
+fi
+
+print_success "✓ Proceso completado exitosamente"
+
+log_action "=== PROCESO COMPLETADO ==="
