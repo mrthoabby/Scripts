@@ -244,23 +244,90 @@ check_and_clean_node() {
 check_and_clean_containers() {
     log_step 3 12 "Verificando contenedores existentes"
     
-    local containers=("n8n_postgres" "n8n_redis" "n8n_app" "n8n-postgres" "n8n-redis" "n8n")
-    local found_containers=false
+    # Contenedores principales (nombres actuales con guiones bajos)
+    local main_containers=("n8n_postgres" "n8n_redis" "n8n_app")
+    # Contenedores legacy (nombres antiguos con guiones o sin prefijo)
+    local legacy_containers=("n8n-postgres" "n8n-redis" "n8n")
+    # Combinar todos para limpieza completa
+    local all_containers=("${main_containers[@]}" "${legacy_containers[@]}")
     
-    for container in "${containers[@]}"; do
+    local found_containers=false
+    local problematic_containers=()
+    local healthy_containers=()
+    local all_healthy=true
+    
+    echo ""
+    echo -e "${CYAN}Analizando contenedores existentes...${NC}\n"
+    
+    # Verificar contenedores principales primero
+    for container in "${main_containers[@]}"; do
         if docker ps -a --format '{{.Names}}' | grep -q "^${container}$"; then
             found_containers=true
-            log_warning "Container detectado: $container"
+            local status=$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null || echo "unknown")
+            local health=$(docker inspect --format='{{.State.Health.Status}}' "$container" 2>/dev/null || echo "none")
+            
+            if [ "$status" = "running" ]; then
+                if [ "$health" = "healthy" ] || [ "$health" = "none" ]; then
+                    echo -e "  ${GREEN}${CHECK}${NC} ${container}: ${GREEN}Corriendo${NC} (${health})"
+                    healthy_containers+=("$container")
+                else
+                    echo -e "  ${YELLOW}${WARN}${NC} ${container}: ${YELLOW}Corriendo pero no saludable${NC} (${health})"
+                    problematic_containers+=("$container")
+                    all_healthy=false
+                fi
+            else
+                echo -e "  ${RED}${CROSS}${NC} ${container}: ${RED}${status}${NC}"
+                problematic_containers+=("$container")
+                all_healthy=false
+            fi
+        else
+            all_healthy=false
         fi
     done
     
-    if [ "$found_containers" = true ]; then
-        read -p "¿Eliminar todos los contenedores de n8n? (y/N): " -n 1 -r
+    # Verificar contenedores legacy (nombres antiguos)
+    for container in "${legacy_containers[@]}"; do
+        if docker ps -a --format '{{.Names}}' | grep -q "^${container}$"; then
+            found_containers=true
+            local status=$(docker inspect --format='{{.State.Status}}' "$container" 2>/dev/null || echo "unknown")
+            echo -e "  ${YELLOW}${WARN}${NC} ${container}: ${YELLOW}${status}${NC} (legacy)"
+            problematic_containers+=("$container")
+        fi
+    done
+    
+    echo ""
+    
+    if [ "$found_containers" = false ]; then
+        log_success "No hay contenedores previos de n8n"
+        return 0
+    fi
+    
+    # Si TODOS los contenedores principales están corriendo y saludables
+    if [ ${#healthy_containers[@]} -eq 3 ] && [ "$all_healthy" = true ]; then
+        echo -e "${GREEN}${BOLD}✓ Todos los contenedores principales están corriendo correctamente${NC}\n"
+        echo -e "${CYAN}Contenedores detectados:${NC}"
+        for container in "${healthy_containers[@]}"; do
+            echo -e "  ${GREEN}${CHECK}${NC} $container"
+        done
+        echo ""
+        echo -e "${YELLOW}═══════════════════════════════════════${NC}"
+        echo -e "${BOLD}¿Deseas hacer una reinstalación limpia?${NC}"
+        echo -e "${YELLOW}Esto eliminará:${NC}"
+        echo -e "  ${RED}•${NC} Todos los contenedores de n8n"
+        echo -e "  ${RED}•${NC} Todas las imágenes de n8n"
+        echo -e "  ${RED}•${NC} Todos los volúmenes de n8n"
+        echo -e "  ${RED}•${NC} Todas las redes de n8n"
+        echo -e "${YELLOW}═══════════════════════════════════════${NC}"
+        read -p "¿Continuar con reinstalación limpia? (s/N): " -n 1 -r
         echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            log_info "Deteniendo y eliminando contenedores..."
+        echo -e "${YELLOW}═══════════════════════════════════════${NC}\n"
+        
+        if [[ $REPLY =~ ^[SsYy]$ ]]; then
+            log_warning "Iniciando reinstalación limpia completa..."
             
-            for container in "${containers[@]}"; do
+            # Detener y eliminar todos los contenedores relacionados con n8n
+            log_info "Deteniendo contenedores..."
+            for container in "${all_containers[@]}"; do
                 if docker ps -a --format '{{.Names}}' | grep -q "^${container}$"; then
                     docker stop "$container" 2>&1 | tee -a "$LOG_FILE" || true
                     docker rm "$container" 2>&1 | tee -a "$LOG_FILE" || true
@@ -268,20 +335,88 @@ check_and_clean_containers() {
                 fi
             done
             
-            # Eliminar volúmenes
-            log_info "Eliminando volúmenes..."
-            docker volume prune -f 2>&1 | tee -a "$LOG_FILE"
-            log_success "Contenedores y volúmenes eliminados"
+            # Eliminar imágenes de n8n
+            log_info "Eliminando imágenes de n8n..."
+            local n8n_images=$(docker images --format "{{.Repository}}:{{.Tag}}" | grep -E "(n8n|n8nio)" || true)
+            if [ -n "$n8n_images" ]; then
+                echo "$n8n_images" | while read -r image; do
+                    docker rmi "$image" -f 2>&1 | tee -a "$LOG_FILE" || true
+                    log_success "Imagen eliminada: $image"
+                done
+            else
+                log_info "No se encontraron imágenes de n8n para eliminar"
+            fi
+            
+            # Eliminar volúmenes relacionados con n8n
+            log_info "Eliminando volúmenes de n8n..."
+            cd "$INSTALL_DIR" 2>/dev/null || true
+            if [ -f "docker-compose.yml" ]; then
+                docker_compose_cmd down -v 2>&1 | tee -a "$LOG_FILE" || true
+            fi
+            
+            # Eliminar volúmenes manualmente si existen
+            local n8n_volumes=$(docker volume ls --format "{{.Name}}" | grep -E "(n8n|postgres_data|n8n_data)" || true)
+            if [ -n "$n8n_volumes" ]; then
+                echo "$n8n_volumes" | while read -r volume; do
+                    docker volume rm "$volume" -f 2>&1 | tee -a "$LOG_FILE" || true
+                    log_success "Volumen eliminado: $volume"
+                done
+            fi
+            
+            # Eliminar redes relacionadas con n8n
+            log_info "Eliminando redes de n8n..."
+            local n8n_networks=$(docker network ls --format "{{.Name}}" | grep -E "(n8n|n8n_network)" || true)
+            if [ -n "$n8n_networks" ]; then
+                echo "$n8n_networks" | while read -r network; do
+                    docker network rm "$network" 2>&1 | tee -a "$LOG_FILE" || true
+                    log_success "Red eliminada: $network"
+                done
+            fi
+            
+            log_success "Reinstalación limpia completada. Todo relacionado con n8n ha sido eliminado."
+            echo ""
+            return 0
+        else
+            log_info "Manteniendo contenedores existentes. El script continuará con la configuración actual."
+            echo ""
+            return 0
         fi
-    else
-        log_success "No hay contenedores previos"
+    fi
+    
+    # Si hay contenedores problemáticos
+    if [ ${#problematic_containers[@]} -gt 0 ]; then
+        echo -e "${YELLOW}${BOLD}Contenedores con problemas detectados:${NC}"
+        for container in "${problematic_containers[@]}"; do
+            echo -e "  ${YELLOW}${ARROW}${NC} $container"
+        done
+        echo ""
+        echo -e "${YELLOW}═══════════════════════════════════════${NC}"
+        read -p "¿Eliminar solo los contenedores problemáticos? (s/N): " -n 1 -r
+        echo
+        echo -e "${YELLOW}═══════════════════════════════════════${NC}\n"
+        
+        if [[ $REPLY =~ ^[SsYy]$ ]]; then
+            log_info "Eliminando contenedores problemáticos..."
+            
+            for container in "${problematic_containers[@]}"; do
+                if docker ps -a --format '{{.Names}}' | grep -q "^${container}$"; then
+                    docker stop "$container" 2>&1 | tee -a "$LOG_FILE" || true
+                    docker rm "$container" 2>&1 | tee -a "$LOG_FILE" || true
+                    log_success "Eliminado: $container"
+                fi
+            done
+            
+            log_success "Contenedores problemáticos eliminados"
+        else
+            log_info "Manteniendo contenedores existentes"
+        fi
     fi
 }
 
 # ==================== VALIDACIONES DETALLADAS ====================
 
 validate_docker() {
-    log_step 9 12 "Validando Docker"
+    log_step 9 17 "Validando Docker"
     
     VALIDATION_TOTAL=$((VALIDATION_TOTAL + 3))
     
@@ -320,29 +455,51 @@ validate_docker() {
 }
 
 validate_containers() {
-    log_step 10 12 "Validando contenedores"
+    log_step 10 17 "Validando contenedores"
     
     VALIDATION_TOTAL=$((VALIDATION_TOTAL + 3))
     
-    local required_containers=("postgres" "redis" "n8n")
+    # Nombres exactos de los contenedores según docker-compose.yml
+    local container_names=("n8n_postgres" "n8n_redis" "n8n_app")
+    local container_labels=("PostgreSQL" "Redis" "n8n")
     local all_running=true
     
-    for container in "${required_containers[@]}"; do
-        if docker ps --filter "name=n8n" --filter "name=$container" --format '{{.Names}}' | grep -q "$container"; then
-            local status=$(docker inspect --format='{{.State.Status}}' $(docker ps -q --filter "name=$container" --filter "name=n8n") 2>/dev/null)
+    for i in "${!container_names[@]}"; do
+        local container_name="${container_names[$i]}"
+        local container_label="${container_labels[$i]}"
+        
+        # Buscar contenedor por nombre exacto
+        local container_id=$(docker ps -q --filter "name=^${container_name}$" 2>/dev/null | head -n1)
+        
+        if [ -n "$container_id" ]; then
+            # Obtener estado del contenedor
+            local status=$(docker inspect --format='{{.State.Status}}' "$container_id" 2>/dev/null)
+            
             if [ "$status" = "running" ]; then
-                log_success "n8n_${container} corriendo"
+                log_success "${container_label} (${container_name}) corriendo"
                 VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
             else
-                log_error "n8n_${container} no está corriendo (Estado: $status)"
-                docker logs $(docker ps -aq --filter "name=$container" --filter "name=n8n") --tail 50 | tee -a "$LOG_FILE"
+                log_error "${container_label} (${container_name}) no está corriendo (Estado: $status)"
+                # Mostrar logs solo si el contenedor existe
+                if docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
+                    docker logs "$container_name" --tail 50 2>&1 | tee -a "$LOG_FILE" || true
+                fi
                 VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
                 all_running=false
             fi
         else
-            log_warning "n8n_${container} no encontrado (se creará)"
-            VALIDATION_WARNINGS=$((VALIDATION_WARNINGS + 1))
-            all_running=false
+            # Verificar si existe pero está detenido
+            if docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
+                local status=$(docker inspect --format='{{.State.Status}}' "$container_name" 2>/dev/null)
+                log_error "${container_label} (${container_name}) no está corriendo (Estado: $status)"
+                docker logs "$container_name" --tail 50 2>&1 | tee -a "$LOG_FILE" || true
+                VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+                all_running=false
+            else
+                log_warning "${container_label} (${container_name}) no encontrado"
+                VALIDATION_WARNINGS=$((VALIDATION_WARNINGS + 1))
+                all_running=false
+            fi
         fi
     done
     
@@ -354,7 +511,7 @@ validate_containers() {
 }
 
 validate_container_health() {
-    log_step 11 12 "Validando health checks"
+    log_step 11 17 "Validando health checks"
     
     VALIDATION_TOTAL=$((VALIDATION_TOTAL + 1))
     
@@ -388,7 +545,7 @@ validate_container_health() {
 }
 
 validate_nginx() {
-    log_step 9 12 "Validando Nginx"
+    log_step 12 17 "Validando Nginx"
     
     VALIDATION_TOTAL=$((VALIDATION_TOTAL + 3))
     
@@ -430,7 +587,7 @@ validate_nginx() {
 }
 
 validate_ssl() {
-    log_step 7 10 "Validando SSL"
+    log_step 13 17 "Validando SSL"
     
     VALIDATION_TOTAL=$((VALIDATION_TOTAL + 2))
     
@@ -457,23 +614,33 @@ validate_ssl() {
 }
 
 validate_ports() {
-    log_step 8 10 "Validando puertos"
+    log_step 14 17 "Validando puertos"
     
     VALIDATION_TOTAL=$((VALIDATION_TOTAL + 1))
     
-    if docker exec -it $(docker ps -q --filter "name=n8n_app" --filter "name=n8n" | head -1) wget -q -O- http://localhost:5678/healthz 2>/dev/null | grep -q "ok"; then
+    # Buscar contenedor n8n_app por nombre exacto
+    local container_id=$(docker ps -q --filter "name=^n8n_app$" 2>/dev/null | head -n1)
+    
+    if [ -z "$container_id" ]; then
+        log_error "Contenedor n8n_app no está corriendo"
+        VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
+        return 1
+    fi
+    
+    # Verificar que el puerto responda
+    if docker exec "$container_id" wget -q -O- http://localhost:5678/healthz 2>/dev/null | grep -q "ok"; then
         log_success "Puerto 5678 responde"
         VALIDATION_PASSED=$((VALIDATION_PASSED + 1))
     else
         log_error "Puerto 5678 no responde"
-        docker logs $(docker ps -q --filter "name=n8n_app" --filter "name=n8n" | head -1) --tail 30 | tee -a "$LOG_FILE"
+        docker logs "$container_id" --tail 30 2>&1 | tee -a "$LOG_FILE" || true
         VALIDATION_ERRORS=$((VALIDATION_ERRORS + 1))
         return 1
     fi
 }
 
 validate_http_internal() {
-    log_step 9 10 "Validando endpoint /healthz"
+    log_step 15 17 "Validando endpoint /healthz"
     
     VALIDATION_TOTAL=$((VALIDATION_TOTAL + 1))
     
@@ -490,7 +657,7 @@ validate_http_internal() {
 }
 
 validate_http_external() {
-    log_step 10 10 "Validando HTTP externo"
+    log_step 16 17 "Validando HTTP externo"
     
     VALIDATION_TOTAL=$((VALIDATION_TOTAL + 1))
     
@@ -506,7 +673,7 @@ validate_http_external() {
 }
 
 validate_https_external() {
-    log_step 11 10 "Validando HTTPS externo"
+    log_step 17 17 "Validando HTTPS externo"
     
     VALIDATION_TOTAL=$((VALIDATION_TOTAL + 2))
     
@@ -1167,11 +1334,28 @@ EOF
     # Desplegar
     log_step 5 12 "Desplegando contenedores"
     cd "$INSTALL_DIR"
-    docker_compose_cmd up -d
     
-    if [ $? -ne 0 ]; then
-        log_error "Error al desplegar contenedores"
-        return 1
+    # Verificar si los contenedores ya están corriendo
+    local containers_running=0
+    for container in "n8n_postgres" "n8n_redis" "n8n_app"; do
+        if docker ps --format '{{.Names}}' | grep -q "^${container}$"; then
+            containers_running=$((containers_running + 1))
+        fi
+    done
+    
+    if [ $containers_running -eq 3 ]; then
+        log_info "Los contenedores ya están corriendo, verificando estado..."
+        docker_compose_cmd ps
+        log_success "Contenedores ya desplegados"
+    else
+        log_info "Desplegando contenedores..."
+        docker_compose_cmd up -d
+        
+        if [ $? -ne 0 ]; then
+            log_error "Error al desplegar contenedores"
+            return 1
+        fi
+        log_success "Contenedores desplegados"
     fi
     
     sleep 10
