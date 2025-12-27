@@ -216,7 +216,7 @@ collect_credentials() {
 # ==================== LIMPIEZA DE INSTALACIÓN PREVIA ====================
 
 check_and_clean_node() {
-    log_step 1 10 "Verificando Node.js y n8n previo"
+    log_step 2 12 "Verificando Node.js y n8n previo"
     
     # Verificar n8n global
     if command -v n8n &> /dev/null; then
@@ -242,7 +242,7 @@ check_and_clean_node() {
 }
 
 check_and_clean_containers() {
-    log_step 2 10 "Verificando contenedores existentes"
+    log_step 3 12 "Verificando contenedores existentes"
     
     local containers=("n8n_postgres" "n8n_redis" "n8n_app" "n8n-postgres" "n8n-redis" "n8n")
     local found_containers=false
@@ -281,7 +281,7 @@ check_and_clean_containers() {
 # ==================== VALIDACIONES DETALLADAS ====================
 
 validate_docker() {
-    log_step 3 10 "Validando Docker"
+    log_step 9 12 "Validando Docker"
     
     VALIDATION_TOTAL=$((VALIDATION_TOTAL + 3))
     
@@ -320,7 +320,7 @@ validate_docker() {
 }
 
 validate_containers() {
-    log_step 4 10 "Validando contenedores"
+    log_step 10 12 "Validando contenedores"
     
     VALIDATION_TOTAL=$((VALIDATION_TOTAL + 3))
     
@@ -354,7 +354,7 @@ validate_containers() {
 }
 
 validate_container_health() {
-    log_step 5 10 "Validando health checks"
+    log_step 11 12 "Validando health checks"
     
     VALIDATION_TOTAL=$((VALIDATION_TOTAL + 1))
     
@@ -388,7 +388,7 @@ validate_container_health() {
 }
 
 validate_nginx() {
-    log_step 6 10 "Validando Nginx"
+    log_step 9 12 "Validando Nginx"
     
     VALIDATION_TOTAL=$((VALIDATION_TOTAL + 3))
     
@@ -533,9 +533,150 @@ validate_https_external() {
 
 # ==================== INSTALACIÓN ====================
 
+# Función helper para ejecutar docker compose (detecta automáticamente el comando correcto)
+docker_compose_cmd() {
+    # Intentar primero con docker compose (versión moderna integrada)
+    if docker compose version &> /dev/null; then
+        docker compose "$@"
+    # Si no funciona, intentar con docker-compose (versión legacy)
+    elif command -v docker-compose &> /dev/null; then
+        docker-compose "$@"
+    else
+        log_error "Docker Compose no está disponible"
+        return 1
+    fi
+}
+
+# Función para verificar y mostrar estado de dependencias
+check_dependencies_status() {
+    echo ""
+    print_box "VERIFICACIÓN DE DEPENDENCIAS"
+    echo -e "${BOLD}Este script requiere las siguientes dependencias:${NC}\n"
+    
+    local docker_status=""
+    local docker_version=""
+    local docker_running=""
+    local compose_status=""
+    local compose_version=""
+    local nginx_status=""
+    local certbot_status=""
+    
+    local missing_deps=()
+    local installed_deps=()
+    
+    # Verificar Docker
+    if command -v docker &> /dev/null; then
+        docker_version=$(docker --version | cut -d' ' -f3 | tr -d ',')
+        docker_status="${GREEN}${CHECK} Instalado${NC} (versión: $docker_version)"
+        installed_deps+=("Docker")
+        
+        # Verificar si está corriendo
+        if systemctl is-active --quiet docker 2>/dev/null; then
+            docker_running="${GREEN}${CHECK} Activo${NC}"
+        else
+            docker_running="${YELLOW}${WARN} Inactivo${NC} (se intentará iniciar)"
+            # No agregar a missing_deps porque se puede iniciar automáticamente
+        fi
+    else
+        docker_status="${RED}${CROSS} No instalado${NC}"
+        docker_running="${RED}${CROSS} N/A${NC}"
+        missing_deps+=("Docker")
+    fi
+    
+    # Verificar Docker Compose
+    if docker compose version &> /dev/null; then
+        compose_version=$(docker compose version --short 2>/dev/null || echo "integrado")
+        compose_status="${GREEN}${CHECK} Instalado${NC} (versión: $compose_version - integrado)"
+        installed_deps+=("Docker Compose")
+    elif command -v docker-compose &> /dev/null; then
+        compose_version=$(docker-compose --version | cut -d' ' -f4 | tr -d ',')
+        compose_status="${GREEN}${CHECK} Instalado${NC} (versión: $compose_version - legacy)"
+        installed_deps+=("Docker Compose")
+    else
+        compose_status="${RED}${CROSS} No instalado${NC}"
+        missing_deps+=("Docker Compose")
+    fi
+    
+    # Verificar Nginx (opcional, se instalará si falta)
+    if command -v nginx &> /dev/null; then
+        nginx_version=$(nginx -v 2>&1 | cut -d'/' -f2)
+        nginx_status="${GREEN}${CHECK} Instalado${NC} (versión: $nginx_version)"
+        installed_deps+=("Nginx")
+    else
+        nginx_status="${YELLOW}${WARN} No instalado${NC} (se instalará automáticamente)"
+        missing_deps+=("Nginx")
+    fi
+    
+    # Verificar Certbot (opcional, se instalará si falta)
+    if command -v certbot &> /dev/null; then
+        certbot_version=$(certbot --version 2>&1 | cut -d' ' -f2)
+        certbot_status="${GREEN}${CHECK} Instalado${NC} (versión: $certbot_version)"
+        installed_deps+=("Certbot")
+    else
+        certbot_status="${YELLOW}${WARN} No instalado${NC} (se instalará automáticamente)"
+        missing_deps+=("Certbot")
+    fi
+    
+    # Mostrar estado de cada dependencia
+    echo -e "  ${CYAN}Docker:${NC}           $docker_status"
+    echo -e "  ${CYAN}Estado Docker:${NC}    $docker_running"
+    echo -e "  ${CYAN}Docker Compose:${NC}   $compose_status"
+    echo -e "  ${CYAN}Nginx:${NC}            $nginx_status"
+    echo -e "  ${CYAN}Certbot:${NC}          $certbot_status"
+    echo ""
+    
+    # Resumen
+    if [ ${#installed_deps[@]} -gt 0 ]; then
+        echo -e "${GREEN}${BOLD}Dependencias instaladas y activas:${NC}"
+        for dep in "${installed_deps[@]}"; do
+            echo -e "  ${GREEN}${CHECK}${NC} $dep"
+        done
+        echo ""
+    fi
+    
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        echo -e "${YELLOW}${BOLD}Dependencias que se instalarán:${NC}"
+        for dep in "${missing_deps[@]}"; do
+            echo -e "  ${YELLOW}${ARROW}${NC} $dep"
+        done
+        echo ""
+    else
+        echo -e "${GREEN}${BOLD}Todas las dependencias están instaladas y activas${NC}\n"
+    fi
+    
+    # Si hay dependencias faltantes, pedir confirmación
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        echo -e "${YELLOW}═══════════════════════════════════════${NC}"
+        read -p "¿Deseas continuar e instalar las dependencias faltantes? (s/N): " -n 1 -r
+        echo
+        echo -e "${YELLOW}═══════════════════════════════════════${NC}\n"
+        
+        if [[ ! $REPLY =~ ^[SsYy]$ ]]; then
+            log_warning "Instalación cancelada por el usuario"
+            echo -e "${YELLOW}El script se detendrá. Puedes instalar las dependencias manualmente y ejecutar el script nuevamente.${NC}\n"
+            return 1
+        fi
+        
+        log_info "Continuando con la instalación de dependencias..."
+        return 0
+    else
+        log_success "Todas las dependencias están listas"
+        return 0
+    fi
+}
+
 install_docker_if_needed() {
-    if ! command -v docker &> /dev/null; then
-        log_info "Instalando Docker..."
+    log_step 1 12 "Instalando dependencias faltantes"
+    
+    local docker_installed=false
+    local compose_installed=false
+    
+    # Verificar Docker
+    if command -v docker &> /dev/null; then
+        log_success "Docker ya está instalado: $(docker --version | cut -d' ' -f3 | tr -d ',')"
+        docker_installed=true
+    else
+        log_info "Docker no está instalado, instalando..."
         
         apt-get update
         apt-get install -y ca-certificates curl gnupg lsb-release
@@ -553,11 +694,66 @@ install_docker_if_needed() {
         systemctl enable docker
         systemctl start docker
         
+        # Esperar un momento para que Docker inicie
+        sleep 3
+        
         log_success "Docker instalado"
+        docker_installed=true
+    fi
+    
+    # Verificar que Docker esté corriendo
+    if ! systemctl is-active --quiet docker; then
+        log_error "Docker no está corriendo. Intentando iniciar..."
+        systemctl start docker
+        sleep 2
+        if ! systemctl is-active --quiet docker; then
+            log_error "No se pudo iniciar Docker"
+            return 1
+        fi
+        log_success "Docker iniciado"
+    fi
+    
+    # Verificar Docker Compose (versión moderna o legacy)
+    if docker compose version &> /dev/null; then
+        log_success "Docker Compose disponible (versión integrada)"
+        compose_installed=true
+    elif command -v docker-compose &> /dev/null; then
+        log_success "Docker Compose disponible (versión legacy)"
+        compose_installed=true
+    else
+        log_warning "Docker Compose no encontrado, instalando..."
+        
+        # Intentar instalar docker-compose-plugin si no está instalado
+        if ! dpkg -l | grep -q docker-compose-plugin; then
+            apt-get update
+            apt-get install -y docker-compose-plugin
+        fi
+        
+        # Si aún no funciona, instalar docker-compose legacy
+        if ! docker compose version &> /dev/null && ! command -v docker-compose &> /dev/null; then
+            curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
+        fi
+        
+        # Verificar nuevamente
+        if docker compose version &> /dev/null || command -v docker-compose &> /dev/null; then
+            log_success "Docker Compose instalado"
+            compose_installed=true
+        else
+            log_error "No se pudo instalar Docker Compose"
+            return 1
+        fi
+    fi
+    
+    if [ "$docker_installed" = true ] && [ "$compose_installed" = true ]; then
+        return 0
+    else
+        return 1
     fi
 }
 
 create_docker_compose_file() {
+    log_step 4 12 "Creando configuración de Docker Compose"
     mkdir -p "$INSTALL_DIR"
     
     cat > "$INSTALL_DIR/docker-compose.yml" << EOF
@@ -646,6 +842,7 @@ EOF
 }
 
 setup_nginx() {
+    log_step 6 12 "Configurando Nginx"
     if ! command -v nginx &> /dev/null; then
         apt-get install -y nginx
     fi
@@ -711,6 +908,7 @@ EOF
 }
 
 setup_ssl() {
+    log_step 7 12 "Configurando certificados SSL"
     if ! command -v certbot &> /dev/null; then
         apt-get install -y certbot python3-certbot-nginx
     fi
@@ -724,13 +922,20 @@ setup_ssl() {
 }
 
 create_aliases() {
-    cat > /etc/profile.d/n8n.sh << 'EOF'
+    log_step 8 12 "Creando aliases útiles"
+    # Detectar comando de docker compose para usar en aliases
+    local compose_cmd="docker compose"
+    if ! docker compose version &> /dev/null; then
+        compose_cmd="docker-compose"
+    fi
+    
+    cat > /etc/profile.d/n8n.sh << EOF
 alias n8n-logs='docker logs -f n8n_app'
-alias n8n-status='cd /opt/n8n && docker-compose ps'
-alias n8n-restart='cd /opt/n8n && docker-compose restart'
-alias n8n-stop='cd /opt/n8n && docker-compose stop'
-alias n8n-start='cd /opt/n8n && docker-compose start'
-alias n8n-backup='docker exec n8n_postgres pg_dump -U n8n n8n > /opt/n8n/backup-$(date +%Y%m%d-%H%M%S).sql'
+alias n8n-status='cd /opt/n8n && ${compose_cmd} ps'
+alias n8n-restart='cd /opt/n8n && ${compose_cmd} restart'
+alias n8n-stop='cd /opt/n8n && ${compose_cmd} stop'
+alias n8n-start='cd /opt/n8n && ${compose_cmd} start'
+alias n8n-backup='docker exec n8n_postgres pg_dump -U n8n n8n > /opt/n8n/backup-\$(date +%Y%m%d-%H%M%S).sql'
 alias n8n-fix-perms='docker exec n8n_app chown -R node:node /home/node/.n8n'
 EOF
 
@@ -925,6 +1130,28 @@ main() {
 EOF
     echo -e "Production Installer v${SCRIPT_VERSION}${NC}\n"
     
+    # PASO CRÍTICO: Verificar estado de dependencias y pedir confirmación
+    if ! check_dependencies_status; then
+        log_warning "Instalación cancelada por el usuario"
+        exit 0
+    fi
+    
+    # Instalar dependencias faltantes si el usuario confirmó
+    if ! install_docker_if_needed; then
+        log_error "No se pudieron instalar las dependencias necesarias"
+        log_error "Por favor, instala Docker y Docker Compose manualmente"
+        exit 1
+    fi
+    
+    # Verificar que Docker Compose funcione antes de continuar
+    if ! docker_compose_cmd version &> /dev/null; then
+        log_error "Docker Compose no está disponible después de la instalación"
+        exit 1
+    fi
+    
+    log_success "Todas las dependencias están instaladas y funcionando"
+    echo ""
+    
     # Recolectar credenciales
     collect_credentials
     
@@ -932,13 +1159,18 @@ EOF
     check_and_clean_node
     check_and_clean_containers
     
-    # Instalación
-    install_docker_if_needed
+    # Crear archivo docker-compose.yml
     create_docker_compose_file
     
     # Desplegar
+    log_step 5 12 "Desplegando contenedores"
     cd "$INSTALL_DIR"
-    docker-compose up -d
+    docker_compose_cmd up -d
+    
+    if [ $? -ne 0 ]; then
+        log_error "Error al desplegar contenedores"
+        return 1
+    fi
     
     sleep 10
     
