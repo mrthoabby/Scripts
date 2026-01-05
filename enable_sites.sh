@@ -1014,6 +1014,70 @@ configure_ssl() {
     if [ $certbot_exit -eq 0 ]; then
         echo -e "${GREEN}✓ SSL configurado correctamente para $domain${NC}"
         
+        # Encontrar el archivo de configuración
+        local site_config_file=""
+        if [ -d "$NGINX_SITES_AVAILABLE" ] && [ -f "$NGINX_SITES_AVAILABLE/$domain" ]; then
+            site_config_file="$NGINX_SITES_AVAILABLE/$domain"
+        elif [ -d "$NGINX_CONF_DIR" ] && [ -f "$NGINX_CONF_DIR/$domain" ]; then
+            site_config_file="$NGINX_CONF_DIR/$domain"
+        fi
+        
+        # Verificar si las directivas SSL están configuradas (especialmente importante para Next.js)
+        if [ -n "$site_config_file" ] && [ -f "$site_config_file" ]; then
+            local has_ssl_cert=$(grep -qE "^\s*ssl_certificate\s+" "$site_config_file" 2>/dev/null && echo "yes" || echo "no")
+            
+            if [ "$has_ssl_cert" = "no" ]; then
+                echo -e "${YELLOW}⚠ Certbot completó pero no se detectaron directivas SSL en la configuración${NC}"
+                echo -e "${CYAN}Verificando si el certificado existe y agregando directivas SSL manualmente...${NC}"
+                
+                # Verificar si el certificado existe
+                local cert_path="/etc/letsencrypt/live/$domain/fullchain.pem"
+                local key_path="/etc/letsencrypt/live/$domain/privkey.pem"
+                
+                if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+                    echo -e "${CYAN}Certificado encontrado. Agregando directivas SSL a la configuración...${NC}"
+                    
+                    # Crear backup
+                    local backup_file="${site_config_file}.backup.$(date +%Y%m%d_%H%M%S)"
+                    sudo cp "$site_config_file" "$backup_file" 2>/dev/null
+                    
+                    # Buscar el bloque server con listen 443 y agregar SSL si no está
+                    if grep -qE "^\s*listen\s+443" "$site_config_file" 2>/dev/null; then
+                        # Verificar si hay directivas SSL comentadas
+                        if grep -qE "^\s*#\s*ssl_certificate" "$site_config_file" 2>/dev/null; then
+                            # Descomentar las líneas SSL
+                            sudo sed -i "s|^\s*#\s*ssl_certificate\s\+/etc/letsencrypt/live/$domain/fullchain.pem;|    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;|g" "$site_config_file"
+                            sudo sed -i "s|^\s*#\s*ssl_certificate_key\s\+/etc/letsencrypt/live/$domain/privkey.pem;|    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;|g" "$site_config_file"
+                            echo -e "${GREEN}✓ Directivas SSL descomentadas${NC}"
+                        else
+                            # Agregar directivas SSL después de server_name
+                            sudo sed -i "/^\s*server_name\s\+$domain;/a\\
+    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;\\
+    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;\\
+    ssl_protocols TLSv1.2 TLSv1.3;\\
+    ssl_ciphers HIGH:!aNULL:!MD5;\\
+    ssl_prefer_server_ciphers on;" "$site_config_file"
+                            echo -e "${GREEN}✓ Directivas SSL agregadas${NC}"
+                        fi
+                    fi
+                    
+                    # Validar configuración
+                    if sudo nginx -t &> /dev/null; then
+                        echo -e "${GREEN}✓ Configuración validada después de agregar SSL${NC}"
+                    else
+                        echo -e "${RED}✗ Error en configuración después de agregar SSL${NC}"
+                        sudo nginx -t
+                        # Restaurar backup
+                        sudo mv "$backup_file" "$site_config_file" 2>/dev/null
+                        echo -e "${YELLOW}Configuración restaurada desde backup${NC}"
+                        return 1
+                    fi
+                else
+                    echo -e "${YELLOW}⚠ Certificado no encontrado en las rutas esperadas${NC}"
+                fi
+            fi
+        fi
+        
         # Verificar que la configuración SSL esté correcta
         if sudo nginx -t &> /dev/null; then
             echo -e "${GREEN}✓ Configuración de Nginx validada${NC}"
@@ -1024,13 +1088,6 @@ configure_ssl() {
             
             # Verificar configuración SSL
             echo -e "\n${CYAN}Verificando configuración SSL...${NC}"
-            local site_config_file=""
-            if [ -d "$NGINX_SITES_AVAILABLE" ] && [ -f "$NGINX_SITES_AVAILABLE/$domain" ]; then
-                site_config_file="$NGINX_SITES_AVAILABLE/$domain"
-            elif [ -d "$NGINX_CONF_DIR" ] && [ -f "$NGINX_CONF_DIR/$domain" ]; then
-                site_config_file="$NGINX_CONF_DIR/$domain"
-            fi
-            
             if [ -n "$site_config_file" ]; then
                 verify_ssl_certificate_config "$domain" "$site_config_file"
                 local verify_result=$?
@@ -1210,6 +1267,70 @@ verify_ssl_certificate_config() {
         echo -e "  ${GREEN}✓${NC} SSL configurado en Nginx"
         if [ "$cert_exists" = true ]; then
             echo -e "  ${GREEN}✓${NC} Archivo de certificado existe"
+            
+            # Verificar si el certificado corresponde al dominio
+            local cert_subject=$(sudo openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN=\([^/]*\).*/\1/' | tr -d ' ')
+            local cert_sans=$(sudo openssl x509 -in "$cert_path" -noout -text 2>/dev/null | grep -A 1 "Subject Alternative Name" | grep "DNS:" | sed 's/.*DNS:\([^,]*\).*/\1/' | tr -d ' ' | head -5)
+            
+            if [ -n "$cert_subject" ]; then
+                echo -e "  ${CYAN}  Certificado CN: $cert_subject${NC}"
+                
+                # Verificar si corresponde al dominio
+                local cert_matches=false
+                
+                # Verificar CN (puede ser wildcard o dominio específico)
+                if [ "$cert_subject" = "$domain" ]; then
+                    # Coincide exactamente
+                    cert_matches=true
+                elif [[ "$cert_subject" == *.* ]]; then
+                    # Verificar si es wildcard (empieza con *)
+                    if [[ "$cert_subject" == *.* ]]; then
+                        local cert_base="${cert_subject#*.}"
+                        # Si es wildcard (*.dominio.com)
+                        if [[ "$cert_subject" == *.$cert_base ]]; then
+                            # Verificar si el dominio coincide con el wildcard
+                            local domain_base="${domain#*.}"
+                            if [ "$domain_base" = "$cert_base" ]; then
+                                cert_matches=true
+                            fi
+                        # Si no es wildcard, verificar coincidencia exacta
+                        elif [ "$cert_subject" = "$domain" ]; then
+                            cert_matches=true
+                        fi
+                    fi
+                fi
+                
+                # Verificar SANs
+                if [ -n "$cert_sans" ] && [ "$cert_matches" = false ]; then
+                    echo -e "  ${CYAN}  Certificado SANs:${NC}"
+                    while IFS= read -r san; do
+                        if [ -n "$san" ]; then
+                            echo -e "    • $san"
+                            # Verificar coincidencia exacta
+                            if [ "$san" = "$domain" ]; then
+                                cert_matches=true
+                            # Verificar wildcard en SAN
+                            elif [[ "$san" == *.* ]]; then
+                                local san_base="${san#*.}"
+                                if [[ "$san" == *.$san_base ]]; then
+                                    # Es wildcard (*.dominio.com)
+                                    local domain_base="${domain#*.}"
+                                    if [ "$domain_base" = "$san_base" ]; then
+                                        cert_matches=true
+                                    fi
+                                fi
+                            fi
+                        fi
+                    done <<< "$cert_sans"
+                fi
+                
+                if [ "$cert_matches" = false ]; then
+                    echo -e "  ${RED}✗${NC} Certificado NO corresponde al dominio '$domain'"
+                    echo -e "    ${YELLOW}El certificado es para otro dominio. Esto puede causar error 526 en Cloudflare.${NC}"
+                else
+                    echo -e "  ${GREEN}✓${NC} Certificado corresponde al dominio"
+                fi
+            fi
         else
             echo -e "  ${RED}✗${NC} Archivo de certificado NO existe"
             if [ -n "$cert_path" ]; then
@@ -1475,12 +1596,57 @@ diagnose_ssl_issue() {
         issue_descriptions+=("SSL no configurado en Nginx")
     fi
     
-    # Verificar si los archivos de certificado existen
+    # Verificar si los archivos de certificado existen y si el certificado corresponde al dominio
     if [ "$ssl_configured" = true ]; then
         local cert_path=$(grep -E "^\s*ssl_certificate\s+" "$config_file" 2>/dev/null | head -1 | sed 's/.*ssl_certificate\s\+\([^;]*\);.*/\1/' | tr -d ' ')
         if [ -n "$cert_path" ] && [ ! -f "$cert_path" ]; then
             issues+=("cert_file_missing")
             issue_descriptions+=("Archivo de certificado no existe: $cert_path")
+        elif [ -n "$cert_path" ] && [ -f "$cert_path" ]; then
+            # Verificar si el certificado corresponde al dominio
+            local cert_subject=$(sudo openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | sed 's/.*CN=\([^/]*\).*/\1/' | tr -d ' ')
+            local cert_sans=$(sudo openssl x509 -in "$cert_path" -noout -text 2>/dev/null | grep -A 1 "Subject Alternative Name" | grep "DNS:" | sed 's/.*DNS:\([^,]*\).*/\1/' | tr -d ' ')
+            
+            local cert_matches=false
+            local cert_domains=()
+            
+            # Verificar CN
+            if [ -n "$cert_subject" ]; then
+                cert_domains+=("$cert_subject")
+                # Verificar si es wildcard
+                if [[ "$cert_subject" == *.* ]]; then
+                    local base_domain="${cert_subject#*.}"
+                    if [[ "$domain" == *"$base_domain" ]] || [[ "$cert_subject" == "*.$base_domain" ]]; then
+                        cert_matches=true
+                    fi
+                elif [ "$cert_subject" = "$domain" ]; then
+                    cert_matches=true
+                fi
+            fi
+            
+            # Verificar SANs
+            if [ -n "$cert_sans" ]; then
+                while IFS= read -r san; do
+                    if [ -n "$san" ]; then
+                        cert_domains+=("$san")
+                        if [[ "$san" == *.* ]]; then
+                            local san_base="${san#*.}"
+                            if [[ "$domain" == *"$san_base" ]] || [[ "$san" == "*.$san_base" ]]; then
+                                cert_matches=true
+                            fi
+                        elif [ "$san" = "$domain" ]; then
+                            cert_matches=true
+                        fi
+                    fi
+                done <<< "$cert_sans"
+            fi
+            
+            # Si el certificado no corresponde al dominio
+            if [ "$cert_matches" = false ] && [ ${#cert_domains[@]} -gt 0 ]; then
+                issues+=("cert_domain_mismatch")
+                local cert_domains_str=$(IFS=', '; echo "${cert_domains[*]}")
+                issue_descriptions+=("Certificado no corresponde al dominio. Certificado para: $cert_domains_str, pero dominio es: $domain")
+            fi
         fi
         
         local key_path=$(grep -E "^\s*ssl_certificate_key\s+" "$config_file" 2>/dev/null | head -1 | sed 's/.*ssl_certificate_key\s\+\([^;]*\);.*/\1/' | tr -d ' ')
@@ -1501,6 +1667,33 @@ diagnose_ssl_issue() {
             issues+=("cert_expiring_soon")
             issue_descriptions+=("Certificado expira pronto (${days_remaining} días)")
         fi
+    fi
+    
+    # Probar conexión HTTPS para detectar problemas como código 526
+    if command -v curl &> /dev/null; then
+        local https_test=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 --connect-timeout 5 -k "https://$domain" 2>/dev/null)
+        
+        # Detectar códigos HTTP que indican problemas SSL
+        case "$https_test" in
+            526)
+                # Error específico de Cloudflare: Invalid SSL Certificate
+                if [ "$ssl_configured" = false ]; then
+                    # Si no está configurado, ya lo detectamos arriba
+                    if [[ ! " ${issues[@]} " =~ " no_nginx_config " ]]; then
+                        issues+=("no_nginx_config")
+                        issue_descriptions+=("Error Cloudflare 526: SSL no configurado correctamente en Nginx")
+                    fi
+                else
+                    # Está configurado pero Cloudflare no lo acepta
+                    issues+=("cloudflare_526_error")
+                    issue_descriptions+=("Error Cloudflare 526: Certificado no válido para Cloudflare (puede ser problema de configuración SSL)")
+                fi
+                ;;
+            502|520|521|522|523|524|525)
+                issues+=("cloudflare_ssl_error")
+                issue_descriptions+=("Error Cloudflare $https_test: Problema de SSL entre Cloudflare y servidor de origen")
+                ;;
+        esac
     fi
     
     # Retornar issues como string separado por |
@@ -1525,10 +1718,17 @@ repair_ssl_configuration() {
             
             # Verificar si hay un bloque server con listen 443
             local has_https_block=false
+            local is_nextjs_config=false
             if [ -f "$config_file" ]; then
                 if grep -qE "^\s*listen\s+443" "$config_file" 2>/dev/null; then
                     has_https_block=true
                     echo -e "${YELLOW}Se detectó un bloque HTTPS pero sin configuración SSL${NC}"
+                    
+                    # Verificar si es configuración de Next.js
+                    if grep -qE "# Tipo: Next.js|# Configuración para Next.js" "$config_file" 2>/dev/null; then
+                        is_nextjs_config=true
+                        echo -e "${CYAN}Detectada configuración de Next.js con SSL sin configurar${NC}"
+                    fi
                 fi
             fi
             
@@ -1558,6 +1758,41 @@ repair_ssl_configuration() {
             if [ $certbot_exit -eq 0 ]; then
                 echo -e "${GREEN}✓ SSL reconfigurado correctamente${NC}"
                 
+                # Si es configuración Next.js, verificar que las directivas SSL estén presentes
+                if [ "$is_nextjs_config" = true ]; then
+                    echo -e "${CYAN}Verificando configuración SSL en Next.js...${NC}"
+                    local has_ssl_cert=$(grep -qE "^\s*ssl_certificate\s+" "$config_file" 2>/dev/null && echo "yes" || echo "no")
+                    
+                    if [ "$has_ssl_cert" = "no" ]; then
+                        echo -e "${YELLOW}⚠ Certbot completó pero no se detectaron directivas SSL. Agregándolas manualmente...${NC}"
+                        
+                        local cert_path="/etc/letsencrypt/live/$domain/fullchain.pem"
+                        local key_path="/etc/letsencrypt/live/$domain/privkey.pem"
+                        
+                        if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+                            # Crear backup
+                            local backup_file="${config_file}.backup.$(date +%Y%m%d_%H%M%S)"
+                            sudo cp "$config_file" "$backup_file" 2>/dev/null
+                            
+                            # Descomentar o agregar directivas SSL
+                            if grep -qE "^\s*#\s*ssl_certificate" "$config_file" 2>/dev/null; then
+                                sudo sed -i "s|^\s*#\s*ssl_certificate\s\+/etc/letsencrypt/live/$domain/fullchain.pem;|    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;|g" "$config_file"
+                                sudo sed -i "s|^\s*#\s*ssl_certificate_key\s\+/etc/letsencrypt/live/$domain/privkey.pem;|    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;|g" "$config_file"
+                                echo -e "${GREEN}✓ Directivas SSL descomentadas${NC}"
+                            else
+                                # Agregar después de server_name
+                                sudo sed -i "/^\s*server_name\s\+$domain;/a\\
+    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;\\
+    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;\\
+    ssl_protocols TLSv1.2 TLSv1.3;\\
+    ssl_ciphers HIGH:!aNULL:!MD5;\\
+    ssl_prefer_server_ciphers on;" "$config_file"
+                                echo -e "${GREEN}✓ Directivas SSL agregadas${NC}"
+                            fi
+                        fi
+                    fi
+                fi
+                
                 # Validar y recargar Nginx
                 if sudo nginx -t &> /dev/null; then
                     sudo systemctl reload nginx 2>/dev/null || sudo nginx -s reload 2>/dev/null
@@ -1579,12 +1814,35 @@ repair_ssl_configuration() {
                 echo -e "${YELLOW}Logs del error:${NC}"
                 cat /tmp/certbot_repair_${domain}.log 2>/dev/null | tail -30 | sed 's/^/  /'
                 
-                # Si Certbot falla, puede ser que necesite configuración manual
-                if [ "$has_https_block" = true ]; then
-                    echo -e "\n${YELLOW}Posible solución manual:${NC}"
-                    echo -e "El bloque HTTPS existe pero Certbot no pudo configurarlo automáticamente."
-                    echo -e "Puede ser necesario agregar manualmente las directivas SSL al bloque server."
+                # Si Certbot falla, intentar agregar SSL manualmente si es Next.js
+                if [ "$has_https_block" = true ] && [ "$is_nextjs_config" = true ]; then
+                    echo -e "\n${CYAN}Intentando agregar SSL manualmente para configuración Next.js...${NC}"
+                    local cert_path="/etc/letsencrypt/live/$domain/fullchain.pem"
+                    local key_path="/etc/letsencrypt/live/$domain/privkey.pem"
+                    
+                    if [ -f "$cert_path" ] && [ -f "$key_path" ]; then
+                        local backup_file="${config_file}.backup.$(date +%Y%m%d_%H%M%S)"
+                        sudo cp "$config_file" "$backup_file" 2>/dev/null
+                        
+                        # Descomentar o agregar directivas SSL
+                        if grep -qE "^\s*#\s*ssl_certificate" "$config_file" 2>/dev/null; then
+                            sudo sed -i "s|^\s*#\s*ssl_certificate\s\+/etc/letsencrypt/live/$domain/fullchain.pem;|    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;|g" "$config_file"
+                            sudo sed -i "s|^\s*#\s*ssl_certificate_key\s\+/etc/letsencrypt/live/$domain/privkey.pem;|    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;|g" "$config_file"
+                            
+                            if sudo nginx -t &> /dev/null; then
+                                sudo systemctl reload nginx 2>/dev/null || sudo nginx -s reload 2>/dev/null
+                                echo -e "${GREEN}✓ SSL configurado manualmente${NC}"
+                                return 0
+                            else
+                                sudo mv "$backup_file" "$config_file" 2>/dev/null
+                            fi
+                        fi
+                    fi
                 fi
+                
+                echo -e "\n${YELLOW}Posible solución manual:${NC}"
+                echo -e "El bloque HTTPS existe pero Certbot no pudo configurarlo automáticamente."
+                echo -e "Puede ser necesario agregar manualmente las directivas SSL al bloque server."
                 
                 return 1
             fi
@@ -1633,6 +1891,89 @@ repair_ssl_configuration() {
             configure_ssl "$domain" "$email"
             return $?
             ;;
+        cloudflare_526_error)
+            echo -e "${CYAN}Error Cloudflare 526 detectado.${NC}"
+            echo -e "${CYAN}El certificado está configurado pero Cloudflare no lo acepta.${NC}"
+            echo -e "${CYAN}Reconfigurando SSL para asegurar compatibilidad con Cloudflare...${NC}"
+            
+            # Obtener email
+            local email=$(sudo certbot certificates 2>/dev/null | grep -A 10 "$domain" | grep "Account" | awk '{print $3}' | head -1)
+            if [ -z "$email" ]; then
+                local base_domain=$(echo "$domain" | sed 's/^[^.]*\.//')
+                email=$(sudo certbot certificates 2>/dev/null | grep -A 10 "$base_domain" | grep "Account" | awk '{print $3}' | head -1)
+            fi
+            
+            if [ -z "$email" ]; then
+                read -p "Ingresa el email para certificados SSL: " email
+                if [ -z "$email" ]; then
+                    email="admin@$domain"
+                fi
+            fi
+            
+            # Verificar que el certificado esté correctamente configurado
+            echo -e "${CYAN}Verificando configuración actual...${NC}"
+            verify_ssl_certificate_config "$domain" "$config_file"
+            
+            # Intentar reconfigurar con Certbot
+            echo -e "${CYAN}Reconfigurando SSL con Certbot...${NC}"
+            if sudo certbot --nginx -d "$domain" --non-interactive --agree-tos --email "$email" --redirect --keep-until-expiring 2>&1 | tee /tmp/certbot_repair_526_${domain}.log; then
+                echo -e "${GREEN}✓ SSL reconfigurado${NC}"
+                
+                if sudo nginx -t &> /dev/null; then
+                    sudo systemctl reload nginx 2>/dev/null || sudo nginx -s reload 2>/dev/null
+                    echo -e "${GREEN}✓ Nginx recargado${NC}"
+                    
+                    sleep 2
+                    echo -e "${CYAN}Verificando después de reparación...${NC}"
+                    verify_ssl_certificate_config "$domain" "$config_file"
+                    return 0
+                else
+                    echo -e "${RED}✗ Error en configuración de Nginx${NC}"
+                    sudo nginx -t
+                    return 1
+                fi
+            else
+                echo -e "${RED}✗ Error al reconfigurar SSL${NC}"
+                cat /tmp/certbot_repair_526_${domain}.log 2>/dev/null | tail -30 | sed 's/^/  /'
+                return 1
+            fi
+            ;;
+        cloudflare_ssl_error)
+            echo -e "${CYAN}Error de Cloudflare detectado. Reconfigurando SSL...${NC}"
+            repair_ssl_configuration "$domain" "$config_file" "no_nginx_config"
+            ;;
+        cert_domain_mismatch)
+            echo -e "${CYAN}El certificado no corresponde al dominio '$domain'.${NC}"
+            echo -e "${YELLOW}Problema detectado:${NC}"
+            echo -e "  • El certificado configurado es para otro dominio"
+            echo -e "  • Esto causa que Cloudflare rechace la conexión (error 526)"
+            echo -e "  • Necesitas un certificado específico para este dominio"
+            echo ""
+            
+            read -p "¿Deseas crear un nuevo certificado específico para '$domain'? (s/n): " create_new_cert
+            if [[ "$create_new_cert" =~ ^[Ss]$ ]]; then
+                # Obtener email
+                local email=$(sudo certbot certificates 2>/dev/null | grep -A 10 "$domain" | grep "Account" | awk '{print $3}' | head -1)
+                if [ -z "$email" ]; then
+                    local base_domain=$(echo "$domain" | sed 's/^[^.]*\.//')
+                    email=$(sudo certbot certificates 2>/dev/null | grep -A 10 "$base_domain" | grep "Account" | awk '{print $3}' | head -1)
+                fi
+                
+                if [ -z "$email" ]; then
+                    read -p "Ingresa el email para certificados SSL: " email
+                    if [ -z "$email" ]; then
+                        email="admin@$domain"
+                    fi
+                fi
+                
+                echo -e "${CYAN}Creando nuevo certificado específico para '$domain'...${NC}"
+                configure_ssl "$domain" "$email"
+                return $?
+            else
+                echo -e "${YELLOW}Operación cancelada. Necesitas crear un certificado específico para este dominio.${NC}"
+                return 1
+            fi
+            ;;
         *)
             echo -e "${YELLOW}No se puede reparar automáticamente: $issue_type${NC}"
             return 1
@@ -1648,15 +1989,38 @@ repair_site_ssl_interactive() {
     echo -e "${CYAN}${BOLD}Reparación SSL para: $domain${NC}"
     echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
     
-    # Diagnosticar problemas
+    # Diagnosticar problemas (esto ahora incluye prueba HTTPS)
     local diagnosis=$(diagnose_ssl_issue "$domain" "$config_file")
     local diagnose_exit=$?
     
-    if [ $diagnose_exit -eq 0 ]; then
-        echo -e "${GREEN}✓ No se detectaron problemas obvios${NC}"
-        echo -e "${CYAN}Verificando conexión HTTPS...${NC}"
-        test_ssl_connection "$domain"
+    # Siempre probar conexión HTTPS para mostrar resultados al usuario
+    echo -e "${CYAN}Probando conexión HTTPS...${NC}"
+    test_ssl_connection "$domain"
+    local https_test_exit=$?
+    
+    # Si no se detectaron problemas en el diagnóstico pero la prueba HTTPS falla,
+    # forzar un nuevo diagnóstico que incluya la prueba HTTPS
+    if [ $diagnose_exit -eq 0 ] && [ $https_test_exit -ne 0 ]; then
+        echo -e "${YELLOW}⚠ La configuración parece correcta pero la conexión HTTPS falla${NC}"
+        echo -e "${CYAN}Re-diagnosticando con prueba HTTPS...${NC}"
+        diagnosis=$(diagnose_ssl_issue "$domain" "$config_file")
+        diagnose_exit=$?
+    fi
+    
+    if [ $diagnose_exit -eq 0 ] && [ $https_test_exit -eq 0 ]; then
+        echo -e "\n${GREEN}✓ No se detectaron problemas. SSL funcionando correctamente.${NC}\n"
         return 0
+    fi
+    
+    # Si hay problemas, continuar con el proceso de reparación
+    if [ $diagnose_exit -eq 0 ]; then
+        # Si después de la prueba HTTPS aún no detecta problemas, pero HTTPS falla,
+        # crear un diagnóstico manual basado en el código HTTP
+        local http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 --connect-timeout 5 -k "https://$domain" 2>/dev/null)
+        if [ "$http_code" = "526" ]; then
+            diagnosis="cloudflare_526_error|Error Cloudflare 526: Certificado no válido para Cloudflare"
+            diagnose_exit=1
+        fi
     fi
     
     IFS='|' read -r issues issue_descriptions <<< "$diagnosis"
