@@ -534,11 +534,19 @@ select_site_type() {
     
     read -p "Opción (1-3) [Por defecto: 1]: " site_type_choice
     
-    case $site_type_choice in
+    # Limpiar espacios y convertir a número
+    site_type_choice=$(echo "$site_type_choice" | tr -d ' ')
+    
+    case "$site_type_choice" in
         2)
             echo "nextjs"
             ;;
+        1|3|"")
+            echo "api"
+            ;;
         *)
+            # Si es algo inválido, usar por defecto
+            echo -e "${YELLOW}Opción inválida, usando API por defecto${NC}"
             echo "api"
             ;;
     esac
@@ -796,7 +804,7 @@ create_nginx_config() {
     
     # Seleccionar tipo de sitio si no se proporcionó
     if [ -z "$site_type" ]; then
-        site_type=$(select_site_type)
+        site_type=$(select_site_type | tr -d '\n\r ')
         echo ""
         if [ "$site_type" = "nextjs" ]; then
             echo -e "${GREEN}✓ Tipo seleccionado: Web Next.js${NC}"
