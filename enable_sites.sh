@@ -2185,6 +2185,6 @@ main() {
     echo -e "${GREEN}${BOLD}Proceso completado.${NC}\n"
 }
 
-# Ejecutar función principal
+# Ejecutar función principal.
 main
 
