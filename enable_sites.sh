@@ -25,6 +25,7 @@ NGINX_CONF_DIR="/etc/nginx/conf.d"
 DOCKER_CONTAINERS=()
 NGINX_SITES=()
 SELECTED_CONTAINERS=()
+DELETE_SITES_LIST=()
 
 ###############################################################################
 # FUNCIONES DE VALIDACIÓN
@@ -150,7 +151,7 @@ get_docker_containers() {
         exit 1
     fi
     
-    local containers=$(docker ps --format "{{.Names}}|{{.Ports}}|{{.ID}}")
+    local containers=$(docker ps --format "{{.Names}}|{{.Ports}}|{{.ID}}|{{.Status}}")
     
     if [ -z "$containers" ]; then
         echo -e "${YELLOW}No hay contenedores Docker en ejecución.${NC}\n"
@@ -158,11 +159,52 @@ get_docker_containers() {
     fi
     
     local index=1
-    while IFS='|' read -r name ports id; do
+    while IFS='|' read -r name ports id status; do
         echo -e "${CYAN}${BOLD}Contenedor #$index:${NC}"
         echo -e "  ${GREEN}Nombre:${NC} $name"
         echo -e "  ${GREEN}ID:${NC} $id"
         echo -e "  ${GREEN}Puertos:${NC} $ports"
+        echo -e "  ${GREEN}Estado:${NC} $status"
+        
+        # Obtener tiempo de ejecución
+        local uptime=$(docker inspect "$name" --format='{{.State.StartedAt}}' 2>/dev/null)
+        if [ -n "$uptime" ]; then
+            # Intentar parsear la fecha (formato ISO 8601)
+            local start_time=""
+            # Linux: date -d
+            if date -d "$uptime" +%s &>/dev/null; then
+                start_time=$(date -d "$uptime" +%s 2>/dev/null)
+            # macOS: date -j -f
+            elif date -j -f "%Y-%m-%dT%H:%M:%S" "${uptime%.*}" +%s &>/dev/null 2>&1; then
+                start_time=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${uptime%.*}" +%s 2>/dev/null)
+            # Alternativa: usar docker stats o docker ps
+            else
+                # Usar docker ps para obtener el tiempo de ejecución
+                local status_uptime=$(docker ps --filter "name=$name" --format "{{.Status}}" 2>/dev/null | grep -oE 'Up [0-9]+' | grep -oE '[0-9]+' || echo "")
+                if [ -n "$status_uptime" ]; then
+                    echo -e "  ${GREEN}Tiempo corriendo:${NC} ${status_uptime} (desde status)"
+                fi
+            fi
+            
+            if [ -n "$start_time" ] && [[ "$start_time" =~ ^[0-9]+$ ]]; then
+                local current_time=$(date +%s)
+                local diff=$((current_time - start_time))
+                
+                if [ $diff -gt 0 ]; then
+                    local days=$((diff / 86400))
+                    local hours=$(((diff % 86400) / 3600))
+                    local minutes=$(((diff % 3600) / 60))
+                    
+                    if [ $days -gt 0 ]; then
+                        echo -e "  ${GREEN}Tiempo corriendo:${NC} ${days}d ${hours}h ${minutes}m"
+                    elif [ $hours -gt 0 ]; then
+                        echo -e "  ${GREEN}Tiempo corriendo:${NC} ${hours}h ${minutes}m"
+                    else
+                        echo -e "  ${GREEN}Tiempo corriendo:${NC} ${minutes}m"
+                    fi
+                fi
+            fi
+        fi
         
         # Extraer puertos expuestos (mejorado)
         local exposed_ports=""
@@ -183,6 +225,23 @@ get_docker_containers() {
             echo -e "  ${GREEN}Puertos expuestos:${NC} $exposed_ports"
         else
             echo -e "  ${YELLOW}Sin puertos expuestos al host${NC}"
+        fi
+        
+        # Mostrar últimos 5 logs
+        echo -e "  ${CYAN}Últimos 5 logs:${NC}"
+        local logs=$(docker logs --tail 5 --timestamps "$name" 2>&1)
+        if [ -n "$logs" ] && [ "$logs" != "" ]; then
+            # Limitar el ancho de los logs para mejor visualización
+            echo "$logs" | while IFS= read -r line; do
+                # Truncar líneas muy largas
+                if [ ${#line} -gt 100 ]; then
+                    echo -e "    ${YELLOW}${line:0:97}...${NC}"
+                else
+                    echo -e "    ${YELLOW}$line${NC}"
+                fi
+            done
+        else
+            echo -e "    ${YELLOW}(Sin logs disponibles)${NC}"
         fi
         
         DOCKER_CONTAINERS+=("$name|$ports|$id|$exposed_ports")
@@ -409,10 +468,17 @@ create_nginx_config() {
     fi
     
     # Crear configuración de Nginx
+    # Nota: Inicialmente el bloque HTTP no tiene redirección para permitir validación de Certbot
+    # Certbot agregará la redirección automáticamente después de configurar SSL
     cat > "$site_path" << EOF
+# Configuración HTTP (Certbot agregará redirección a HTTPS después de configurar SSL)
 server {
     listen 80;
+    listen [::]:80;
     server_name $domain;
+    
+    # Este bloque permite la validación de Certbot
+    # Certbot modificará este bloque para agregar redirección a HTTPS
     
     location / {
         proxy_pass http://localhost:$port;
@@ -424,11 +490,47 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_cache_bypass \$http_upgrade;
+        
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+}
+
+# Configuración HTTPS (será completada por Certbot)
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $domain;
+    
+    # Certificados SSL (serán configurados por Certbot)
+    # ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+    # ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    # include /etc/letsencrypt/options-ssl-nginx.conf;
+    # ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    
+    location / {
+        proxy_pass http://localhost:$port;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+        
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
     }
 }
 EOF
     
     echo -e "${GREEN}Configuración creada: $site_path${NC}"
+    echo -e "${CYAN}Certbot agregará automáticamente la redirección HTTP → HTTPS al configurar SSL${NC}"
     
     # Crear enlace simbólico si es necesario
     if [ -d "$NGINX_SITES_ENABLED" ] && [ ! -L "$NGINX_SITES_ENABLED/$site_name" ]; then
@@ -447,16 +549,43 @@ configure_ssl() {
     
     # Verificar configuración de Nginx antes de continuar
     if ! sudo nginx -t &> /dev/null; then
-        echo -e "${YELLOW}Advertencia: La configuración de Nginx tiene errores. Corrigiéndolos...${NC}"
-        # Intentar recargar de todas formas
+        echo -e "${RED}Error: La configuración de Nginx tiene errores.${NC}"
+        echo -e "${YELLOW}Ejecutando: sudo nginx -t${NC}"
+        sudo nginx -t
+        return 1
     fi
     
-    # Ejecutar certbot
-    if sudo certbot --nginx -d "$domain" --non-interactive --agree-tos --email "$email" &> /dev/null; then
+    # Recargar Nginx para asegurar que la configuración esté activa
+    echo -e "${CYAN}Recargando Nginx...${NC}"
+    if sudo systemctl reload nginx 2>/dev/null || sudo nginx -s reload 2>/dev/null; then
+        echo -e "${GREEN}✓ Nginx recargado${NC}"
+    else
+        echo -e "${YELLOW}⚠ Advertencia: No se pudo recargar Nginx${NC}"
+    fi
+    
+    # Ejecutar certbot con opciones mejoradas
+    echo -e "${CYAN}Ejecutando Certbot para obtener certificado SSL...${NC}"
+    if sudo certbot --nginx -d "$domain" \
+        --non-interactive \
+        --agree-tos \
+        --email "$email" \
+        --redirect \
+        --keep-until-expiring 2>&1 | tee /tmp/certbot_${domain}.log; then
         echo -e "${GREEN}✓ SSL configurado correctamente para $domain${NC}"
-        return 0
+        
+        # Verificar que la configuración SSL esté correcta
+        if sudo nginx -t &> /dev/null; then
+            echo -e "${GREEN}✓ Configuración de Nginx validada${NC}"
+            sudo systemctl reload nginx 2>/dev/null || sudo nginx -s reload 2>/dev/null
+            return 0
+        else
+            echo -e "${YELLOW}⚠ Advertencia: Certbot completó pero hay errores en la configuración${NC}"
+            sudo nginx -t
+            return 1
+        fi
     else
         echo -e "${RED}✗ Error al configurar SSL para $domain${NC}"
+        echo -e "${YELLOW}Revisa los logs en /tmp/certbot_${domain}.log${NC}"
         return 1
     fi
 }
@@ -555,8 +684,369 @@ process_containers() {
 }
 
 ###############################################################################
+# FUNCIONES DE ELIMINACIÓN
+###############################################################################
+
+get_domain_from_config() {
+    local config_file=$1
+    if [ -f "$config_file" ]; then
+        # Buscar server_name en el archivo
+        local domain=$(grep -E "^\s*server_name\s+" "$config_file" | head -n1 | sed 's/.*server_name\s\+\([^;]*\);.*/\1/' | tr -d ' ')
+        echo "$domain"
+    fi
+}
+
+check_certbot_certificates() {
+    local domain=$1
+    if [ -z "$domain" ]; then
+        return 1
+    fi
+    
+    # Verificar si hay certificados de certbot para este dominio
+    if sudo certbot certificates 2>/dev/null | grep -q "$domain"; then
+        return 0
+    fi
+    
+    # Verificar si existe el directorio de certificados
+    if [ -d "/etc/letsencrypt/live/$domain" ]; then
+        return 0
+    fi
+    
+    return 1
+}
+
+list_sites_for_deletion() {
+    echo -e "\n${BLUE}${BOLD}${SEPARATOR}${NC}"
+    echo -e "${BLUE}${BOLD}           SITIOS DISPONIBLES PARA ELIMINAR${NC}"
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}\n"
+    
+    local sites_list=()
+    local index=1
+    
+    # Buscar en sites-available
+    if [ -d "$NGINX_SITES_AVAILABLE" ]; then
+        for site_file in "$NGINX_SITES_AVAILABLE"/*; do
+            if [ -f "$site_file" ] && [[ ! "$site_file" =~ default$ ]]; then
+                local site_name=$(basename "$site_file")
+                local domain=$(get_domain_from_config "$site_file")
+                local enabled=""
+                local ssl_info=""
+                
+                if [ -L "$NGINX_SITES_ENABLED/$site_name" ]; then
+                    enabled="${GREEN}[ACTIVO]${NC}"
+                else
+                    enabled="${RED}[INACTIVO]${NC}"
+                fi
+                
+                if [ -n "$domain" ] && check_certbot_certificates "$domain"; then
+                    ssl_info="${CYAN}[SSL]${NC}"
+                fi
+                
+                echo -e "  $index) $site_name $enabled $ssl_info"
+                if [ -n "$domain" ]; then
+                    echo -e "     Dominio: $domain"
+                fi
+                
+                sites_list+=("$site_file|$site_name|$domain")
+                ((index++))
+            fi
+        done
+    fi
+    
+    # Buscar en conf.d
+    if [ -d "$NGINX_CONF_DIR" ]; then
+        for site_file in "$NGINX_CONF_DIR"/*.conf; do
+            if [ -f "$site_file" ]; then
+                local site_name=$(basename "$site_file")
+                local domain=$(get_domain_from_config "$site_file")
+                local ssl_info=""
+                
+                if [ -n "$domain" ] && check_certbot_certificates "$domain"; then
+                    ssl_info="${CYAN}[SSL]${NC}"
+                fi
+                
+                echo -e "  $index) $site_name ${GREEN}[ACTIVO]${NC} $ssl_info"
+                if [ -n "$domain" ]; then
+                    echo -e "     Dominio: $domain"
+                fi
+                
+                sites_list+=("$site_file|$site_name|$domain")
+                ((index++))
+            fi
+        done
+    fi
+    
+    if [ ${#sites_list[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No se encontraron sitios para eliminar.${NC}\n"
+        return 1
+    fi
+    
+    echo ""
+    echo -e "${CYAN}Total de sitios encontrados: ${#sites_list[@]}${NC}\n"
+    
+    # Devolver la lista como variable global
+    DELETE_SITES_LIST=("${sites_list[@]}")
+    return 0
+}
+
+select_site_to_delete() {
+    if [ ${#DELETE_SITES_LIST[@]} -eq 0 ]; then
+        return 1
+    fi
+    
+    read -p "Selecciona el número del sitio a eliminar (o 'q' para cancelar): " selection
+    
+    if [[ "$selection" =~ ^[Qq]$ ]]; then
+        echo -e "${YELLOW}Operación cancelada.${NC}\n"
+        return 1
+    fi
+    
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt ${#DELETE_SITES_LIST[@]} ]; then
+        echo -e "${RED}Selección inválida.${NC}\n"
+        return 1
+    fi
+    
+    local selected_index=$((selection - 1))
+    local selected_site="${DELETE_SITES_LIST[$selected_index]}"
+    
+    IFS='|' read -r site_file site_name domain <<< "$selected_site"
+    
+    echo -e "\n${YELLOW}${BOLD}Sitio seleccionado para eliminar:${NC}"
+    echo -e "  ${CYAN}Archivo:${NC} $site_file"
+    echo -e "  ${CYAN}Nombre:${NC} $site_name"
+    if [ -n "$domain" ]; then
+        echo -e "  ${CYAN}Dominio:${NC} $domain"
+    fi
+    
+    # Verificar si tiene SSL
+    local has_ssl=false
+    if [ -n "$domain" ] && check_certbot_certificates "$domain"; then
+        has_ssl=true
+        echo -e "  ${CYAN}SSL:${NC} ${YELLOW}Tiene certificados SSL configurados${NC}"
+    fi
+    
+    echo ""
+    read -p "¿Estás seguro de que deseas eliminar este sitio? (s/n): " confirm
+    
+    if [[ ! "$confirm" =~ ^[Ss]$ ]]; then
+        echo -e "${YELLOW}Operación cancelada.${NC}\n"
+        return 1
+    fi
+    
+    # Si tiene SSL, preguntar si también eliminar certificados
+    local delete_certs=false
+    if [ "$has_ssl" = true ]; then
+        echo ""
+        read -p "¿Deseas también eliminar los certificados SSL asociados? (s/n): " delete_certs_confirm
+        if [[ "$delete_certs_confirm" =~ ^[Ss]$ ]]; then
+            delete_certs=true
+        fi
+    fi
+    
+    # Llamar a la función de eliminación
+    delete_site "$site_file" "$site_name" "$domain" "$delete_certs"
+    return $?
+}
+
+delete_site() {
+    local site_file=$1
+    local site_name=$2
+    local domain=$3
+    local delete_certs=$4
+    
+    echo -e "\n${CYAN}${BOLD}Eliminando sitio: $site_name${NC}\n"
+    
+    local errors=()
+    local success_steps=()
+    
+    # 1. Deshabilitar el sitio (eliminar enlace simbólico)
+    if [ -L "$NGINX_SITES_ENABLED/$site_name" ]; then
+        echo -e "${CYAN}Deshabilitando sitio...${NC}"
+        if sudo rm "$NGINX_SITES_ENABLED/$site_name" 2>/dev/null; then
+            echo -e "${GREEN}✓ Sitio deshabilitado${NC}"
+            success_steps+=("Sitio deshabilitado")
+        else
+            echo -e "${RED}✗ Error al deshabilitar sitio${NC}"
+            errors+=("Error al deshabilitar sitio")
+        fi
+    fi
+    
+    # 2. Eliminar certificados SSL si se solicitó
+    if [ "$delete_certs" = true ] && [ -n "$domain" ]; then
+        echo -e "${CYAN}Verificando certificados SSL para $domain...${NC}"
+        
+        # Verificar si el certificado tiene múltiples dominios
+        local cert_info=$(sudo certbot certificates 2>/dev/null | grep -A 10 "Certificate Name:.*$domain" | head -20)
+        local cert_name=$(echo "$cert_info" | grep "Certificate Name:" | awk '{print $3}')
+        
+        if [ -z "$cert_name" ]; then
+            # Intentar encontrar el certificado por dominio
+            cert_name=$(sudo certbot certificates 2>/dev/null | grep -B 2 "$domain" | grep "Certificate Name:" | awk '{print $3}' | head -1)
+        fi
+        
+        if [ -n "$cert_name" ]; then
+            # Verificar cuántos dominios tiene el certificado
+            local domains_in_cert=$(sudo certbot certificates 2>/dev/null | grep -A 10 "Certificate Name: $cert_name" | grep "Domains:" | sed 's/.*Domains: //')
+            
+            if [ -n "$domains_in_cert" ]; then
+                local domain_count=$(echo "$domains_in_cert" | tr ',' '\n' | wc -l | tr -d ' ')
+                
+                if [ "$domain_count" -gt 1 ]; then
+                    echo -e "${YELLOW}⚠ Advertencia: El certificado '$cert_name' incluye múltiples dominios:${NC}"
+                    echo -e "${YELLOW}  $domains_in_cert${NC}"
+                    echo -e "${YELLOW}  Eliminar este certificado afectará a otros dominios.${NC}"
+                    read -p "¿Deseas continuar eliminando el certificado completo? (s/n): " confirm_cert_delete
+                    
+                    if [[ ! "$confirm_cert_delete" =~ ^[Ss]$ ]]; then
+                        echo -e "${YELLOW}Eliminación de certificados cancelada.${NC}"
+                        delete_certs=false
+                    fi
+                fi
+            fi
+            
+            if [ "$delete_certs" = true ]; then
+                echo -e "${CYAN}Eliminando certificados SSL...${NC}"
+                if sudo certbot delete --cert-name "$cert_name" --non-interactive 2>/dev/null; then
+                    echo -e "${GREEN}✓ Certificados SSL eliminados${NC}"
+                    success_steps+=("Certificados SSL eliminados")
+                else
+                    echo -e "${YELLOW}⚠ No se pudieron eliminar los certificados automáticamente${NC}"
+                    echo -e "${YELLOW}  Puedes eliminarlos manualmente con: sudo certbot delete --cert-name $cert_name${NC}"
+                    errors+=("Error al eliminar certificados SSL")
+                fi
+            fi
+        else
+            echo -e "${YELLOW}⚠ No se encontraron certificados SSL para $domain${NC}"
+        fi
+    fi
+    
+    # 3. Verificar si otros sitios usan el mismo dominio antes de eliminar el archivo
+    local other_sites_using_domain=false
+    local other_sites_list=()
+    
+    if [ -n "$domain" ]; then
+        # Buscar en sites-available
+        if [ -d "$NGINX_SITES_AVAILABLE" ]; then
+            for other_file in "$NGINX_SITES_AVAILABLE"/*; do
+                if [ -f "$other_file" ] && [ "$other_file" != "$site_file" ]; then
+                    # Buscar el dominio en el archivo (puede estar en múltiples líneas)
+                    if grep -qE "server_name\s+.*$domain" "$other_file" 2>/dev/null; then
+                        other_sites_using_domain=true
+                        local other_site_name=$(basename "$other_file")
+                        other_sites_list+=("$other_site_name")
+                    fi
+                fi
+            done
+        fi
+        
+        # Buscar en conf.d
+        if [ -d "$NGINX_CONF_DIR" ]; then
+            for other_file in "$NGINX_CONF_DIR"/*.conf; do
+                if [ -f "$other_file" ] && [ "$other_file" != "$site_file" ]; then
+                    if grep -qE "server_name\s+.*$domain" "$other_file" 2>/dev/null; then
+                        other_sites_using_domain=true
+                        local other_site_name=$(basename "$other_file")
+                        other_sites_list+=("$other_site_name")
+                    fi
+                fi
+            done
+        fi
+        
+        if [ "$other_sites_using_domain" = true ]; then
+            echo -e "${YELLOW}⚠ Advertencia: Otros sitios también usan el dominio '$domain':${NC}"
+            for other_site in "${other_sites_list[@]}"; do
+                echo -e "${YELLOW}  - $other_site${NC}"
+            done
+            echo -e "${YELLOW}  Los certificados SSL se mantendrán para estos sitios.${NC}"
+        fi
+    fi
+    
+    # 4. Eliminar archivo de configuración
+    if [ -f "$site_file" ]; then
+        echo -e "${CYAN}Eliminando archivo de configuración...${NC}"
+        
+        if sudo rm "$site_file" 2>/dev/null; then
+            echo -e "${GREEN}✓ Archivo de configuración eliminado${NC}"
+            success_steps+=("Archivo eliminado")
+        else
+            echo -e "${RED}✗ Error al eliminar archivo de configuración${NC}"
+            errors+=("Error al eliminar archivo")
+        fi
+    fi
+    
+    # 5. Validar y recargar Nginx
+    echo -e "${CYAN}Validando configuración de Nginx...${NC}"
+    if sudo nginx -t &> /dev/null; then
+        echo -e "${GREEN}✓ Configuración válida${NC}"
+        if sudo systemctl reload nginx 2>/dev/null || sudo nginx -s reload 2>/dev/null; then
+            echo -e "${GREEN}✓ Nginx recargado${NC}"
+            success_steps+=("Nginx recargado")
+        else
+            echo -e "${YELLOW}⚠ Advertencia: No se pudo recargar Nginx${NC}"
+            errors+=("Error al recargar Nginx")
+        fi
+    else
+        echo -e "${RED}✗ Error en la configuración de Nginx${NC}"
+        sudo nginx -t
+        errors+=("Error en configuración de Nginx")
+    fi
+    
+    # Mostrar resumen
+    echo -e "\n${BLUE}${BOLD}Resumen de eliminación:${NC}"
+    if [ ${#success_steps[@]} -gt 0 ]; then
+        echo -e "${GREEN}Operaciones exitosas:${NC}"
+        for step in "${success_steps[@]}"; do
+            echo -e "  ✓ $step"
+        done
+    fi
+    
+    if [ ${#errors[@]} -gt 0 ]; then
+        echo -e "\n${RED}Errores encontrados:${NC}"
+        for error in "${errors[@]}"; do
+            echo -e "  ✗ $error"
+        done
+        return 1
+    else
+        echo -e "\n${GREEN}${BOLD}✓ Sitio eliminado correctamente${NC}\n"
+        return 0
+    fi
+}
+
+###############################################################################
 # FUNCIÓN PRINCIPAL
 ###############################################################################
+
+show_main_menu() {
+    echo -e "\n${BLUE}${BOLD}${SEPARATOR}${NC}"
+    echo -e "${BLUE}${BOLD}           MENÚ PRINCIPAL${NC}"
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}\n"
+    echo -e "${CYAN}¿Qué deseas hacer?${NC}"
+    echo -e "  1) Configurar nuevos sitios para contenedores Docker"
+    echo -e "  2) Eliminar un sitio existente"
+    echo -e "  3) Solo mostrar información (sin cambios)"
+    echo -e "  4) Salir"
+    echo ""
+    read -p "Opción (1-4): " main_option
+    
+    case $main_option in
+        1)
+            return 1  # Configurar sitios
+            ;;
+        2)
+            return 2  # Eliminar sitio
+            ;;
+        3)
+            return 3  # Solo información
+            ;;
+        4)
+            return 4  # Salir
+            ;;
+        *)
+            echo -e "${RED}Opción inválida.${NC}\n"
+            return 0  # Mostrar menú de nuevo
+            ;;
+    esac
+}
 
 main() {
     # Verificar si se ejecuta como root o con sudo
@@ -577,10 +1067,47 @@ main() {
     # Hacer correspondencia
     match_containers_to_sites
     
-    # Seleccionar contenedores para configurar
-    if select_containers; then
-        process_containers
-    fi
+    # Menú principal
+    while true; do
+        show_main_menu
+        local menu_result=$?
+        
+        case $menu_result in
+            1)
+                # Configurar nuevos sitios
+                if select_containers; then
+                    process_containers
+                fi
+                ;;
+            2)
+                # Eliminar sitio
+                if list_sites_for_deletion; then
+                    select_site_to_delete
+                fi
+                ;;
+            3)
+                # Solo mostrar información
+                echo -e "\n${GREEN}Información mostrada. No se realizaron cambios.${NC}\n"
+                break
+                ;;
+            4)
+                # Salir
+                echo -e "\n${GREEN}Saliendo...${NC}\n"
+                break
+                ;;
+            0)
+                # Opción inválida, continuar loop
+                continue
+                ;;
+        esac
+        
+        # Preguntar si desea hacer otra operación
+        echo ""
+        read -p "¿Deseas realizar otra operación? (s/n): " continue_choice
+        if [[ ! "$continue_choice" =~ ^[Ss]$ ]]; then
+            break
+        fi
+    done
     
     echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}\n"
     echo -e "${GREEN}${BOLD}Proceso completado.${NC}\n"
