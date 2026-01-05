@@ -27,6 +27,18 @@ NGINX_SITES=()
 SELECTED_CONTAINERS=()
 DELETE_SITES_LIST=()
 RENAME_SITES_LIST=()
+OPERATION_COUNT=0
+
+# Función para limpiar pantalla cada 3 operaciones
+increment_operation() {
+    ((OPERATION_COUNT++))
+    if [ $((OPERATION_COUNT % 3)) -eq 0 ]; then
+        clear
+        echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}"
+        echo -e "${BLUE}${BOLD}     ENABLE SITES - Gestión de Sitios Nginx${NC}"
+        echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}\n"
+    fi
+}
 
 ###############################################################################
 # FUNCIONES DE VALIDACIÓN
@@ -498,46 +510,66 @@ check_site_exists() {
     return 1
 }
 
-create_nginx_config() {
-    local container_name=$1
+select_site_type() {
+    echo -e "\n${CYAN}¿Qué tipo de sitio deseas configurar?${NC}"
+    echo -e "  1) API (configuración estándar para backend/API)"
+    echo -e "  2) Web Next.js (configuración optimizada para Next.js/React)"
+    echo -e "  3) Por defecto (API)"
+    echo ""
+    read -t 10 -p "Opción (1-3) [Por defecto: 1]: " site_type_choice
+    
+    case $site_type_choice in
+        2)
+            echo "nextjs"
+            ;;
+        *)
+            echo "api"
+            ;;
+    esac
+}
+
+get_nextjs_config() {
+    local domain=$1
+    
+    echo -e "\n${CYAN}${BOLD}Configuración adicional para Next.js:${NC}\n"
+    
+    # Preguntar por directorio público
+    read -t 30 -p "¿Ruta del directorio público? [Por defecto: /public]: " public_dir
+    public_dir="${public_dir:-/public}"
+    
+    # Preguntar por caché de assets estáticos
+    echo ""
+    read -t 10 -p "¿Habilitar caché de assets estáticos? (s/n) [Por defecto: s]: " enable_cache
+    enable_cache="${enable_cache:-s}"
+    
+    # Preguntar por tamaño máximo de upload
+    echo ""
+    read -t 10 -p "¿Tamaño máximo de upload en MB? [Por defecto: 10]: " max_upload
+    max_upload="${max_upload:-10}"
+    
+    # Preguntar por ISR (Incremental Static Regeneration)
+    echo ""
+    read -t 10 -p "¿Habilitar soporte para ISR (Incremental Static Regeneration)? (s/n) [Por defecto: s]: " enable_isr
+    enable_isr="${enable_isr:-s}"
+    
+    echo "$public_dir|$enable_cache|$max_upload|$enable_isr"
+}
+
+create_api_config() {
+    local site_path=$1
     local domain=$2
     local port=$3
     
-    # Verificar si el sitio ya existe
-    local existing_site=$(check_site_exists "$domain")
-    if [ -n "$existing_site" ]; then
-        echo -e "${YELLOW}⚠ El sitio para el dominio '$domain' ya existe:${NC}"
-        echo -e "${CYAN}  Archivo: $existing_site${NC}"
-        echo -e "${YELLOW}  No se creará una nueva configuración.${NC}"
-        return 2  # Código especial para indicar que ya existe
-    fi
-    
-    # Usar el dominio como nombre del archivo (formato estándar: solo dominio, sin .conf)
-    local site_name="$domain"
-    local site_path=""
-    
-    # Determinar dónde crear el archivo
-    if [ -d "$NGINX_SITES_AVAILABLE" ]; then
-        site_path="$NGINX_SITES_AVAILABLE/$site_name"
-    elif [ -d "$NGINX_CONF_DIR" ]; then
-        site_path="$NGINX_CONF_DIR/$site_name"
-    else
-        echo -e "${RED}Error: No se encontró directorio de configuración de Nginx.${NC}"
-        return 1
-    fi
-    
-    # Crear configuración de Nginx
-    # Nota: Inicialmente el bloque HTTP no tiene redirección para permitir validación de Certbot
-    # Certbot agregará la redirección automáticamente después de configurar SSL
-    cat > "$site_path" << EOF
-# Configuración HTTP (Certbot agregará redirección a HTTPS después de configurar SSL)
+    sudo tee "$site_path" > /dev/null << EOF
+# Configuración para API/Backend
+# Tipo: API
+# Dominio: $domain
+# Puerto: $port
+
 server {
     listen 80;
     listen [::]:80;
     server_name $domain;
-    
-    # Este bloque permite la validación de Certbot
-    # Certbot modificará este bloque para agregar redirección a HTTPS
     
     location / {
         proxy_pass http://localhost:$port;
@@ -557,7 +589,6 @@ server {
     }
 }
 
-# Configuración HTTPS (será completada por Certbot)
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
@@ -566,8 +597,6 @@ server {
     # Certificados SSL (serán configurados por Certbot)
     # ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
     # ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
-    # include /etc/letsencrypt/options-ssl-nginx.conf;
-    # ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
     
     location / {
         proxy_pass http://localhost:$port;
@@ -587,6 +616,202 @@ server {
     }
 }
 EOF
+}
+
+create_nextjs_config() {
+    local site_path=$1
+    local domain=$2
+    local port=$3
+    local public_dir=$4
+    local enable_cache=$5
+    local max_upload=$6
+    local enable_isr=$7
+    
+    local cache_config=""
+    local isr_config=""
+    
+    if [[ "$enable_cache" =~ ^[Ss]$ ]]; then
+        cache_config="
+    # Caché para assets estáticos de Next.js
+    location /_next/static {
+        proxy_pass http://localhost:$port;
+        proxy_cache_valid 60m;
+        add_header X-Cache-Status \$upstream_cache_status;
+        add_header Cache-Control \"public, max-age=31536000, immutable\";
+    }
+    
+    # Caché para imágenes optimizadas de Next.js
+    location /_next/image {
+        proxy_pass http://localhost:$port;
+        proxy_cache_valid 60m;
+        add_header X-Cache-Status \$upstream_cache_status;
+    }
+    
+    # Archivos estáticos públicos
+    location /static {
+        proxy_pass http://localhost:$port;
+        add_header Cache-Control \"public, max-age=31536000, immutable\";
+    }"
+    fi
+    
+    if [[ "$enable_isr" =~ ^[Ss]$ ]]; then
+        isr_config="
+    # Soporte para ISR (Incremental Static Regeneration)
+    proxy_cache_revalidate on;
+    proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+    proxy_cache_background_update on;
+    proxy_cache_lock on;"
+    fi
+    
+    sudo tee "$site_path" > /dev/null << EOF
+# Configuración para Next.js Web App
+# Tipo: Next.js
+# Dominio: $domain
+# Puerto: $port
+# Directorio público: $public_dir
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+    
+    # Tamaño máximo de upload
+    client_max_body_size ${max_upload}M;
+    
+    # Gzip compression para mejor rendimiento
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+    
+    location / {
+        proxy_pass http://localhost:$port;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+        
+        # Headers para Next.js
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port \$server_port;
+        
+        # Timeouts extendidos para SSR
+        proxy_connect_timeout 120s;
+        proxy_send_timeout 120s;
+        proxy_read_timeout 120s;
+        
+        # Buffer sizes para páginas grandes
+        proxy_buffer_size 128k;
+        proxy_buffers 4 256k;
+        proxy_busy_buffers_size 256k;
+    }
+$cache_config
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $domain;
+    
+    # Certificados SSL (serán configurados por Certbot)
+    # ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+    # ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    
+    # Tamaño máximo de upload
+    client_max_body_size ${max_upload}M;
+    
+    # Gzip compression para mejor rendimiento
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+$isr_config
+
+    location / {
+        proxy_pass http://localhost:$port;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+        
+        # Headers para Next.js
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port \$server_port;
+        
+        # Timeouts extendidos para SSR
+        proxy_connect_timeout 120s;
+        proxy_send_timeout 120s;
+        proxy_read_timeout 120s;
+        
+        # Buffer sizes para páginas grandes
+        proxy_buffer_size 128k;
+        proxy_buffers 4 256k;
+        proxy_busy_buffers_size 256k;
+    }
+$cache_config
+}
+EOF
+}
+
+create_nginx_config() {
+    local container_name=$1
+    local domain=$2
+    local port=$3
+    local site_type=${4:-""}
+    
+    # Verificar si el sitio ya existe
+    local existing_site=$(check_site_exists "$domain")
+    if [ -n "$existing_site" ]; then
+        echo -e "${YELLOW}⚠ El sitio para el dominio '$domain' ya existe:${NC}"
+        echo -e "${CYAN}  Archivo: $existing_site${NC}"
+        echo -e "${YELLOW}  No se creará una nueva configuración.${NC}"
+        return 2  # Código especial para indicar que ya existe
+    fi
+    
+    # Seleccionar tipo de sitio si no se proporcionó
+    if [ -z "$site_type" ]; then
+        site_type=$(select_site_type)
+    fi
+    
+    # Usar el dominio como nombre del archivo (formato estándar: solo dominio, sin .conf)
+    local site_name="$domain"
+    local site_path=""
+    
+    # Determinar dónde crear el archivo
+    if [ -d "$NGINX_SITES_AVAILABLE" ]; then
+        site_path="$NGINX_SITES_AVAILABLE/$site_name"
+    elif [ -d "$NGINX_CONF_DIR" ]; then
+        site_path="$NGINX_CONF_DIR/$site_name"
+    else
+        echo -e "${RED}Error: No se encontró directorio de configuración de Nginx.${NC}"
+        return 1
+    fi
+    
+    # Crear configuración según el tipo
+    case $site_type in
+        nextjs)
+            echo -e "\n${CYAN}Configurando sitio Next.js...${NC}"
+            local nextjs_options=$(get_nextjs_config "$domain")
+            IFS='|' read -r public_dir enable_cache max_upload enable_isr <<< "$nextjs_options"
+            create_nextjs_config "$site_path" "$domain" "$port" "$public_dir" "$enable_cache" "$max_upload" "$enable_isr"
+            echo -e "${GREEN}✓ Configuración Next.js creada${NC}"
+            ;;
+        *)
+            echo -e "\n${CYAN}Configurando sitio API...${NC}"
+            create_api_config "$site_path" "$domain" "$port"
+            echo -e "${GREEN}✓ Configuración API creada${NC}"
+            ;;
+    esac
     
     echo -e "${GREEN}Configuración creada: $site_path${NC}"
     echo -e "${CYAN}Certbot agregará automáticamente la redirección HTTP → HTTPS al configurar SSL${NC}"
@@ -1512,6 +1737,12 @@ show_main_menu() {
 }
 
 main() {
+    # Limpiar pantalla al inicio
+    clear
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}"
+    echo -e "${BLUE}${BOLD}     ENABLE SITES - Gestión de Sitios Nginx${NC}"
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}\n"
+    
     # Verificar si se ejecuta como root o con sudo
     if [ "$EUID" -ne 0 ] && ! sudo -n true 2>/dev/null; then
         echo -e "${YELLOW}Este script requiere permisos de administrador para algunas operaciones.${NC}"
@@ -1538,24 +1769,28 @@ main() {
         case $menu_result in
             1)
                 # Configurar nuevos sitios
+                increment_operation
                 if select_containers; then
                     process_containers
                 fi
                 ;;
             2)
                 # Eliminar sitio
+                increment_operation
                 if list_sites_for_deletion; then
                     select_site_to_delete
                 fi
                 ;;
             3)
                 # Renombrar sitio
+                increment_operation
                 if list_sites_for_rename; then
                     select_site_to_rename
                 fi
                 ;;
             4)
                 # Estandarizar todos los sitios
+                increment_operation
                 standardize_all_sites
                 ;;
             5)
