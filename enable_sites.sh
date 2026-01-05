@@ -512,6 +512,7 @@ check_site_exists() {
 }
 
 select_site_type() {
+    # Mostrar opciones
     echo -e "\n${BLUE}${BOLD}════════════════════════════════════════════════════════════${NC}"
     echo -e "${BLUE}${BOLD}  SELECCIÓN DE TIPO DE SITIO${NC}"
     echo -e "${BLUE}${BOLD}════════════════════════════════════════════════════════════${NC}\n"
@@ -537,6 +538,7 @@ select_site_type() {
     # Limpiar espacios y convertir a número
     site_type_choice=$(echo "$site_type_choice" | tr -d ' ')
     
+    # Retornar el valor sin mensajes adicionales
     case "$site_type_choice" in
         2)
             echo "nextjs"
@@ -570,6 +572,12 @@ get_nextjs_config() {
     echo ""
     read -p "¿Tamaño máximo de upload en MB? [Por defecto: 10]: " max_upload
     max_upload="${max_upload:-10}"
+    
+    # Validar que sea un número válido
+    if ! [[ "$max_upload" =~ ^[0-9]+$ ]] || [ "$max_upload" -le 0 ]; then
+        echo -e "${YELLOW}Valor inválido, usando 10MB por defecto${NC}"
+        max_upload="10"
+    fi
     
     # Preguntar por ISR (Incremental Static Regeneration)
     echo ""
@@ -804,13 +812,47 @@ create_nginx_config() {
     
     # Seleccionar tipo de sitio si no se proporcionó
     if [ -z "$site_type" ]; then
-        site_type=$(select_site_type | tr -d '\n\r ')
-        echo ""
-        if [ "$site_type" = "nextjs" ]; then
-            echo -e "${GREEN}✓ Tipo seleccionado: Web Next.js${NC}"
-        else
-            echo -e "${GREEN}✓ Tipo seleccionado: API/Backend${NC}"
-        fi
+        # Mostrar opciones primero
+        echo -e "\n${BLUE}${BOLD}════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BLUE}${BOLD}  SELECCIÓN DE TIPO DE SITIO${NC}"
+        echo -e "${BLUE}${BOLD}════════════════════════════════════════════════════════════${NC}\n"
+        echo -e "${CYAN}¿Qué tipo de sitio deseas configurar?${NC}\n"
+        
+        echo -e "${GREEN}1) API/BACKEND${NC}"
+        echo -e "   ${YELLOW}→${NC} Configuración estándar para APIs REST, GraphQL, microservicios"
+        echo -e "   ${YELLOW}→${NC} Proxy reverso básico con soporte WebSockets"
+        echo -e "   ${YELLOW}→${NC} Timeouts: 60 segundos"
+        echo -e "   ${YELLOW}→${NC} Ideal para: Backend APIs, servicios, microservicios\n"
+        
+        echo -e "${GREEN}2) WEB NEXT.JS${NC}"
+        echo -e "   ${YELLOW}→${NC} Configuración optimizada para aplicaciones Next.js/React"
+        echo -e "   ${YELLOW}→${NC} Gzip compression, caché inteligente, soporte ISR"
+        echo -e "   ${YELLOW}→${NC} Timeouts extendidos: 120 segundos (para SSR)"
+        echo -e "   ${YELLOW}→${NC} Buffers aumentados para páginas grandes"
+        echo -e "   ${YELLOW}→${NC} Ideal para: Next.js, React SSR, aplicaciones web modernas\n"
+        
+        echo -e "${CYAN}3) Por defecto (API)${NC}\n"
+        
+        read -p "Opción (1-3) [Por defecto: 1]: " site_type_choice
+        
+        # Limpiar espacios
+        site_type_choice=$(echo "$site_type_choice" | tr -d ' ')
+        
+        # Determinar tipo según selección
+        case "$site_type_choice" in
+            2)
+                site_type="nextjs"
+                echo -e "${GREEN}✓ Tipo seleccionado: Web Next.js${NC}"
+                ;;
+            1|3|"")
+                site_type="api"
+                echo -e "${GREEN}✓ Tipo seleccionado: API/Backend${NC}"
+                ;;
+            *)
+                site_type="api"
+                echo -e "${YELLOW}Opción inválida, usando API por defecto${NC}"
+                ;;
+        esac
         echo ""
     fi
     
@@ -1927,6 +1969,13 @@ change_site_type() {
             echo -e "${CYAN}Obteniendo configuración para Next.js...${NC}"
             local nextjs_options=$(get_nextjs_config "$domain")
             IFS='|' read -r public_dir enable_cache max_upload enable_isr <<< "$nextjs_options"
+            
+            # Validar max_upload antes de usar
+            if ! [[ "$max_upload" =~ ^[0-9]+$ ]] || [ -z "$max_upload" ] || [ "$max_upload" -le 0 ]; then
+                echo -e "${YELLOW}Valor inválido para max_upload, usando 10MB por defecto${NC}"
+                max_upload="10"
+            fi
+            
             create_nextjs_config "$temp_config" "$domain" "$port" "$public_dir" "$enable_cache" "$max_upload" "$enable_isr"
             ;;
         *)
@@ -2185,6 +2234,6 @@ main() {
     echo -e "${GREEN}${BOLD}Proceso completado.${NC}\n"
 }
 
-# Ejecutar función principal.
+# Ejecutar función principal
 main
 
