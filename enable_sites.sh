@@ -1018,6 +1018,29 @@ configure_ssl() {
         if sudo nginx -t &> /dev/null; then
             echo -e "${GREEN}✓ Configuración de Nginx validada${NC}"
             sudo systemctl reload nginx 2>/dev/null || sudo nginx -s reload 2>/dev/null
+            
+            # Esperar un momento para que Nginx se recargue
+            sleep 2
+            
+            # Verificar configuración SSL
+            echo -e "\n${CYAN}Verificando configuración SSL...${NC}"
+            local site_config_file=""
+            if [ -d "$NGINX_SITES_AVAILABLE" ] && [ -f "$NGINX_SITES_AVAILABLE/$domain" ]; then
+                site_config_file="$NGINX_SITES_AVAILABLE/$domain"
+            elif [ -d "$NGINX_CONF_DIR" ] && [ -f "$NGINX_CONF_DIR/$domain" ]; then
+                site_config_file="$NGINX_CONF_DIR/$domain"
+            fi
+            
+            if [ -n "$site_config_file" ]; then
+                verify_ssl_certificate_config "$domain" "$site_config_file"
+                local verify_result=$?
+                
+                if [ $verify_result -eq 0 ]; then
+                    echo -e "\n${CYAN}Probando conexión HTTPS...${NC}"
+                    test_ssl_connection "$domain"
+                fi
+            fi
+            
             return 0
         else
             echo -e "${YELLOW}⚠ Advertencia: Certbot completó pero hay errores en la configuración${NC}"
@@ -1029,6 +1052,394 @@ configure_ssl() {
         echo -e "${YELLOW}Logs del error:${NC}"
         cat /tmp/certbot_${domain}.log 2>/dev/null | tail -20 | sed 's/^/  /'
         echo -e "${YELLOW}Revisa los logs completos en /tmp/certbot_${domain}.log${NC}"
+        return 1
+    fi
+}
+
+###############################################################################
+# FUNCIONES DE VALIDACIÓN SSL
+###############################################################################
+
+get_certificate_expiry_info() {
+    local domain=$1
+    
+    # Intentar obtener información del certificado desde Certbot
+    local cert_info=$(sudo certbot certificates 2>/dev/null | grep -A 20 "$domain" | grep -E "(Certificate Name|Expiry Date|Certificate Path)" | head -5)
+    
+    # Intentar obtener desde el archivo de certificado directamente
+    local cert_path=""
+    if [ -d "/etc/letsencrypt/live/$domain" ]; then
+        cert_path="/etc/letsencrypt/live/$domain/fullchain.pem"
+    fi
+    
+    # Si no encontramos el path desde Certbot, intentar desde Nginx
+    if [ -z "$cert_path" ] || [ ! -f "$cert_path" ]; then
+        # Buscar en sites-available y conf.d
+        for config_dir in "$NGINX_SITES_AVAILABLE" "$NGINX_CONF_DIR"; do
+            if [ -d "$config_dir" ]; then
+                for config_file in "$config_dir"/*; do
+                    if [ -f "$config_file" ] && grep -q "server_name.*$domain" "$config_file" 2>/dev/null; then
+                        local found_cert_path=$(grep -E "^\s*ssl_certificate\s+" "$config_file" 2>/dev/null | head -1 | sed 's/.*ssl_certificate\s\+\([^;]*\);.*/\1/' | tr -d ' ')
+                        if [ -n "$found_cert_path" ] && [ -f "$found_cert_path" ]; then
+                            cert_path="$found_cert_path"
+                            break 2
+                        fi
+                    fi
+                done
+            fi
+        done
+    fi
+    
+    if [ -z "$cert_path" ] || [ ! -f "$cert_path" ]; then
+        return 1
+    fi
+    
+    # Obtener fecha de expiración usando openssl
+    local expiry_date=$(sudo openssl x509 -in "$cert_path" -noout -enddate 2>/dev/null | cut -d= -f2)
+    
+    if [ -z "$expiry_date" ]; then
+        return 1
+    fi
+    
+    # Convertir fecha a timestamp (funciona en Linux y macOS)
+    local expiry_timestamp=""
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS
+        expiry_timestamp=$(date -j -f "%b %d %H:%M:%S %Y %Z" "$expiry_date" "+%s" 2>/dev/null)
+        if [ -z "$expiry_timestamp" ]; then
+            expiry_timestamp=$(date -j -f "%b %d %H:%M:%S %Y" "$expiry_date" "+%s" 2>/dev/null)
+        fi
+    else
+        # Linux
+        expiry_timestamp=$(date -d "$expiry_date" "+%s" 2>/dev/null)
+    fi
+    
+    if [ -z "$expiry_timestamp" ]; then
+        return 1
+    fi
+    
+    # Obtener timestamp actual
+    local current_timestamp=$(date "+%s")
+    
+    # Calcular días restantes
+    local seconds_remaining=$((expiry_timestamp - current_timestamp))
+    local days_remaining=$((seconds_remaining / 86400))
+    
+    # Formatear fecha de expiración para mostrar
+    local expiry_formatted=""
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        expiry_formatted=$(date -j -f "%b %d %H:%M:%S %Y %Z" "$expiry_date" "+%Y-%m-%d" 2>/dev/null)
+        if [ -z "$expiry_formatted" ]; then
+            expiry_formatted=$(date -j -f "%b %d %H:%M:%S %Y" "$expiry_date" "+%Y-%m-%d" 2>/dev/null)
+        fi
+    else
+        expiry_formatted=$(date -d "$expiry_date" "+%Y-%m-%d" 2>/dev/null)
+    fi
+    
+    if [ -z "$expiry_formatted" ]; then
+        expiry_formatted="$expiry_date"
+    fi
+    
+    echo "$days_remaining|$expiry_formatted|$expiry_date"
+    return 0
+}
+
+verify_ssl_certificate_config() {
+    local domain=$1
+    local config_file=$2
+    
+    echo -e "${CYAN}Verificando configuración SSL para $domain...${NC}"
+    
+    local ssl_configured=false
+    local cert_exists=false
+    local key_exists=false
+    local nginx_listening=false
+    
+    # Verificar si el certificado está configurado en Nginx
+    if [ -f "$config_file" ]; then
+        if grep -qE "^\s*ssl_certificate\s+" "$config_file" 2>/dev/null; then
+            ssl_configured=true
+            local cert_path=$(grep -E "^\s*ssl_certificate\s+" "$config_file" | head -1 | sed 's/.*ssl_certificate\s\+\([^;]*\);.*/\1/' | tr -d ' ')
+            
+            if [ -f "$cert_path" ]; then
+                cert_exists=true
+            fi
+            
+            local key_path=$(grep -E "^\s*ssl_certificate_key\s+" "$config_file" | head -1 | sed 's/.*ssl_certificate_key\s\+\([^;]*\);.*/\1/' | tr -d ' ')
+            
+            if [ -f "$key_path" ]; then
+                key_exists=true
+            fi
+        fi
+    fi
+    
+    # Verificar certificado en Certbot
+    if check_certbot_certificates "$domain"; then
+        echo -e "  ${GREEN}✓${NC} Certificado encontrado en Certbot"
+        
+        # Obtener información de expiración
+        local expiry_info=$(get_certificate_expiry_info "$domain")
+        if [ -n "$expiry_info" ]; then
+            IFS='|' read -r days_remaining expiry_formatted expiry_date <<< "$expiry_info"
+            
+            if [ "$days_remaining" -gt 0 ]; then
+                if [ "$days_remaining" -lt 30 ]; then
+                    echo -e "  ${RED}⚠${NC} Certificado expira en ${days_remaining} días (${expiry_formatted})"
+                elif [ "$days_remaining" -lt 60 ]; then
+                    echo -e "  ${YELLOW}⚠${NC} Certificado expira en ${days_remaining} días (${expiry_formatted})"
+                else
+                    echo -e "  ${GREEN}✓${NC} Certificado válido por ${days_remaining} días más (expira: ${expiry_formatted})"
+                fi
+            else
+                echo -e "  ${RED}✗${NC} Certificado EXPIRADO o expira hoy"
+            fi
+        fi
+    else
+        echo -e "  ${RED}✗${NC} Certificado NO encontrado en Certbot"
+    fi
+    
+    # Verificar configuración en Nginx
+    if [ "$ssl_configured" = true ]; then
+        echo -e "  ${GREEN}✓${NC} SSL configurado en Nginx"
+        if [ "$cert_exists" = true ]; then
+            echo -e "  ${GREEN}✓${NC} Archivo de certificado existe"
+        else
+            echo -e "  ${RED}✗${NC} Archivo de certificado NO existe"
+        fi
+        if [ "$key_exists" = true ]; then
+            echo -e "  ${GREEN}✓${NC} Archivo de clave existe"
+        else
+            echo -e "  ${RED}✗${NC} Archivo de clave NO existe"
+        fi
+    else
+        echo -e "  ${RED}✗${NC} SSL NO configurado en Nginx"
+    fi
+    
+    # Verificar que Nginx esté escuchando en 443
+    if sudo netstat -tlnp 2>/dev/null | grep -q ":443 " || sudo ss -tlnp 2>/dev/null | grep -q ":443 "; then
+        nginx_listening=true
+        echo -e "  ${GREEN}✓${NC} Nginx está escuchando en puerto 443"
+    else
+        echo -e "  ${YELLOW}⚠${NC} Nginx NO está escuchando en puerto 443"
+    fi
+    
+    if [ "$ssl_configured" = true ] && [ "$cert_exists" = true ] && [ "$key_exists" = true ] && [ "$nginx_listening" = true ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+test_ssl_connection() {
+    local domain=$1
+    
+    echo -e "${CYAN}Probando conexión HTTPS a $domain...${NC}"
+    
+    # Verificar si curl está disponible
+    if ! command -v curl &> /dev/null; then
+        echo -e "  ${YELLOW}⚠${NC} curl no está instalado, no se puede probar la conexión HTTPS"
+        return 2
+    fi
+    
+    # Primero probar conexión básica (sin verificar certificado)
+    local https_test=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 --connect-timeout 5 -k "https://$domain" 2>/dev/null)
+    local https_exit=$?
+    
+    if [ $https_exit -ne 0 ]; then
+        echo -e "  ${RED}✗${NC} No se pudo conectar vía HTTPS"
+        return 1
+    fi
+    
+    echo -e "  ${GREEN}✓${NC} Conexión HTTPS exitosa (código HTTP: $https_test)"
+    
+    # Ahora verificar el certificado SSL (sin -k)
+    local ssl_verify=$(curl -s -o /dev/null -w "%{ssl_verify_result}" --max-time 10 --connect-timeout 5 "https://$domain" 2>/dev/null)
+    local ssl_exit=$?
+    
+    # ssl_verify_result: 0 = éxito, otros valores = error
+    if [ $ssl_exit -eq 0 ] && [ "$ssl_verify" = "0" ]; then
+        echo -e "  ${GREEN}✓${NC} Certificado SSL válido y verificado"
+        
+        # Obtener información del certificado
+        local cert_info=$(echo | openssl s_client -connect "$domain:443" -servername "$domain" 2>/dev/null | openssl x509 -noout -dates -subject 2>/dev/null)
+        if [ -n "$cert_info" ]; then
+            local cert_subject=$(echo "$cert_info" | grep "subject=" | sed 's/.*subject=//')
+            local cert_valid_from=$(echo "$cert_info" | grep "notBefore=" | sed 's/.*notBefore=//')
+            local cert_valid_to=$(echo "$cert_info" | grep "notAfter=" | sed 's/.*notAfter=//')
+            
+            if [ -n "$cert_subject" ]; then
+                echo -e "  ${CYAN}  Certificado para: $cert_subject${NC}"
+            fi
+            if [ -n "$cert_valid_to" ]; then
+                # Calcular días restantes
+                local expiry_info=$(get_certificate_expiry_info "$domain")
+                if [ -n "$expiry_info" ]; then
+                    IFS='|' read -r days_remaining expiry_formatted expiry_date <<< "$expiry_info"
+                    
+                    if [ "$days_remaining" -gt 0 ]; then
+                        if [ "$days_remaining" -lt 30 ]; then
+                            echo -e "  ${RED}  ⚠ Expira en ${days_remaining} días (${expiry_formatted})${NC}"
+                        elif [ "$days_remaining" -lt 60 ]; then
+                            echo -e "  ${YELLOW}  ⚠ Expira en ${days_remaining} días (${expiry_formatted})${NC}"
+                        else
+                            echo -e "  ${GREEN}  ✓ Válido por ${days_remaining} días más (expira: ${expiry_formatted})${NC}"
+                        fi
+                    else
+                        echo -e "  ${RED}  ✗ Certificado EXPIRADO o expira hoy${NC}"
+                    fi
+                else
+                    echo -e "  ${CYAN}  Válido hasta: $cert_valid_to${NC}"
+                fi
+            fi
+        fi
+        
+        return 0
+    else
+        echo -e "  ${RED}✗${NC} Certificado SSL tiene problemas"
+        if [ "$ssl_verify" != "0" ]; then
+            case "$ssl_verify" in
+                1) echo -e "    ${YELLOW}Error: Certificado no verificado${NC}" ;;
+                2) echo -e "    ${YELLOW}Error: No se pudo verificar el certificado${NC}" ;;
+                3) echo -e "    ${YELLOW}Error: Certificado expirado${NC}" ;;
+                4) echo -e "    ${YELLOW}Error: Certificado auto-firmado${NC}" ;;
+                5) echo -e "    ${YELLOW}Error: Certificado no confiable${NC}" ;;
+                *) echo -e "    ${YELLOW}Error de verificación SSL (código: $ssl_verify)${NC}" ;;
+            esac
+        fi
+        return 1
+    fi
+}
+
+verify_all_sites_ssl() {
+    echo -e "\n${BLUE}${BOLD}${SEPARATOR}${NC}"
+    echo -e "${BLUE}${BOLD}           VALIDACIÓN SSL DE TODOS LOS SITIOS${NC}"
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}\n"
+    
+    local sites_to_verify=()
+    local index=1
+    
+    # Buscar sitios en sites-available
+    if [ -d "$NGINX_SITES_AVAILABLE" ]; then
+        for site_file in "$NGINX_SITES_AVAILABLE"/*; do
+            if [ -f "$site_file" ] && [[ ! "$site_file" =~ default$ ]]; then
+                local site_name=$(basename "$site_file")
+                local domain=$(get_domain_from_config "$site_file")
+                if [ -n "$domain" ]; then
+                    sites_to_verify+=("$site_file|$site_name|$domain")
+                fi
+            fi
+        done
+    fi
+    
+    # Buscar sitios en conf.d
+    if [ -d "$NGINX_CONF_DIR" ]; then
+        for site_file in "$NGINX_CONF_DIR"/*; do
+            if [ -f "$site_file" ]; then
+                local site_name=$(basename "$site_file")
+                local domain=$(get_domain_from_config "$site_file")
+                if [ -n "$domain" ]; then
+                    sites_to_verify+=("$site_file|$site_name|$domain")
+                fi
+            fi
+        done
+    fi
+    
+    if [ ${#sites_to_verify[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No se encontraron sitios para validar.${NC}\n"
+        return 1
+    fi
+    
+    echo -e "${CYAN}Sitios encontrados: ${#sites_to_verify[@]}${NC}\n"
+    
+    local valid_count=0
+    local invalid_count=0
+    local test_failed_count=0
+    
+    for site_info in "${sites_to_verify[@]}"; do
+        IFS='|' read -r site_file site_name domain <<< "$site_info"
+        
+        echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${CYAN}${BOLD}Sitio: $site_name${NC}"
+        echo -e "${CYAN}Dominio: $domain${NC}"
+        echo ""
+        
+        # Verificar configuración SSL
+        if verify_ssl_certificate_config "$domain" "$site_file"; then
+            ((valid_count++))
+            echo -e "  ${GREEN}✓ Configuración SSL correcta${NC}"
+        else
+            ((invalid_count++))
+            echo -e "  ${RED}✗ Configuración SSL tiene problemas${NC}"
+        fi
+        
+        echo ""
+        
+        # Probar conexión HTTPS
+        if test_ssl_connection "$domain"; then
+            echo -e "  ${GREEN}✓ Conexión HTTPS funcionando correctamente${NC}"
+        else
+            ((test_failed_count++))
+            echo -e "  ${RED}✗ Problemas con la conexión HTTPS${NC}"
+        fi
+        
+        echo ""
+    done
+    
+    # Resumen con días restantes de certificados
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}"
+    echo -e "${BLUE}${BOLD}           RESUMEN DE CERTIFICADOS SSL${NC}"
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}\n"
+    
+    echo -e "${CYAN}Estado de certificados por sitio:${NC}\n"
+    printf "%-40s %-15s %-15s\n" "Dominio" "Días Restantes" "Estado"
+    echo -e "${BLUE}────────────────────────────────────────────────────────────────────────────${NC}"
+    
+    for site_info in "${sites_to_verify[@]}"; do
+        IFS='|' read -r site_file site_name domain <<< "$site_info"
+        
+        local expiry_info=$(get_certificate_expiry_info "$domain")
+        if [ -n "$expiry_info" ]; then
+            IFS='|' read -r days_remaining expiry_formatted expiry_date <<< "$expiry_info"
+            
+            local status=""
+            local status_color=""
+            if [ "$days_remaining" -gt 0 ]; then
+                if [ "$days_remaining" -lt 30 ]; then
+                    status="⚠ Expira pronto"
+                    status_color="${RED}"
+                elif [ "$days_remaining" -lt 60 ]; then
+                    status="⚠ Atención"
+                    status_color="${YELLOW}"
+                else
+                    status="✓ Válido"
+                    status_color="${GREEN}"
+                fi
+                printf "%-40s %-15s ${status_color}%-15s${NC}\n" "$domain" "${days_remaining} días" "$status"
+            else
+                printf "%-40s %-15s ${RED}%-15s${NC}\n" "$domain" "EXPIRADO" "✗ Expirado"
+            fi
+        else
+            printf "%-40s %-15s ${RED}%-15s${NC}\n" "$domain" "N/A" "✗ Sin certificado"
+        fi
+    done
+    
+    echo ""
+    
+    # Resumen estadístico
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}"
+    echo -e "${BLUE}${BOLD}           RESUMEN DE VALIDACIÓN${NC}"
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}\n"
+    
+    echo -e "${GREEN}✓ Sitios con SSL correctamente configurado: $valid_count${NC}"
+    echo -e "${RED}✗ Sitios con problemas de configuración SSL: $invalid_count${NC}"
+    echo -e "${YELLOW}⚠ Sitios con problemas de conexión HTTPS: $test_failed_count${NC}"
+    echo ""
+    
+    if [ $invalid_count -eq 0 ] && [ $test_failed_count -eq 0 ]; then
+        echo -e "${GREEN}${BOLD}✓ Todos los sitios tienen SSL funcionando correctamente${NC}\n"
+        return 0
+    else
+        echo -e "${YELLOW}${BOLD}⚠ Algunos sitios necesitan atención${NC}\n"
         return 1
     fi
 }
@@ -2150,10 +2561,11 @@ show_main_menu() {
     echo -e "  3) Renombrar un sitio"
     echo -e "  4) Cambiar tipo de sitio (API ↔ Next.js)"
     echo -e "  5) Estandarizar todos los sitios"
-    echo -e "  6) Solo mostrar información (sin cambios)"
-    echo -e "  7) Salir"
+    echo -e "  6) Validar SSL de todos los sitios"
+    echo -e "  7) Solo mostrar información (sin cambios)"
+    echo -e "  8) Salir"
     echo ""
-    read -p "Opción (1-7): " main_option
+    read -p "Opción (1-8): " main_option
     
     case $main_option in
         1)
@@ -2172,10 +2584,13 @@ show_main_menu() {
             return 5  # Estandarizar sitios
             ;;
         6)
-            return 6  # Solo información
+            return 6  # Validar SSL
             ;;
         7)
-            return 7  # Salir
+            return 7  # Solo información
+            ;;
+        8)
+            return 8  # Salir
             ;;
         *)
             echo -e "${RED}Opción inválida.${NC}\n"
@@ -2249,11 +2664,16 @@ main() {
                 standardize_all_sites
                 ;;
             6)
+                # Validar SSL de todos los sitios
+                increment_operation
+                verify_all_sites_ssl
+                ;;
+            7)
                 # Solo mostrar información
                 echo -e "\n${GREEN}Información mostrada. No se realizaron cambios.${NC}\n"
                 break
                 ;;
-            7)
+            8)
                 # Salir
                 echo -e "\n${GREEN}Saliendo...${NC}\n"
                 break
