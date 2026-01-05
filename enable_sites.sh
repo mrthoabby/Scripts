@@ -1199,20 +1199,42 @@ verify_ssl_certificate_config() {
     fi
     
     # Verificar configuración en Nginx
+    local has_https_block=false
+    if [ -f "$config_file" ]; then
+        if grep -qE "^\s*listen\s+443" "$config_file" 2>/dev/null; then
+            has_https_block=true
+        fi
+    fi
+    
     if [ "$ssl_configured" = true ]; then
         echo -e "  ${GREEN}✓${NC} SSL configurado en Nginx"
         if [ "$cert_exists" = true ]; then
             echo -e "  ${GREEN}✓${NC} Archivo de certificado existe"
         else
             echo -e "  ${RED}✗${NC} Archivo de certificado NO existe"
+            if [ -n "$cert_path" ]; then
+                echo -e "    ${YELLOW}Ruta esperada: $cert_path${NC}"
+            fi
         fi
         if [ "$key_exists" = true ]; then
             echo -e "  ${GREEN}✓${NC} Archivo de clave existe"
         else
             echo -e "  ${RED}✗${NC} Archivo de clave NO existe"
+            if [ -n "$key_path" ]; then
+                echo -e "    ${YELLOW}Ruta esperada: $key_path${NC}"
+            fi
         fi
     else
-        echo -e "  ${RED}✗${NC} SSL NO configurado en Nginx"
+        if [ "$has_https_block" = true ]; then
+            echo -e "  ${RED}✗${NC} SSL NO configurado en Nginx"
+            echo -e "    ${YELLOW}Problema detectado:${NC}"
+            echo -e "    • Existe un bloque server con 'listen 443' pero sin directivas SSL"
+            echo -e "    • El certificado existe en Certbot pero no está vinculado en Nginx"
+            echo -e "    ${CYAN}Solución:${NC} Ejecutar reparación SSL para este sitio"
+        else
+            echo -e "  ${RED}✗${NC} SSL NO configurado en Nginx"
+            echo -e "    ${YELLOW}No hay bloque HTTPS configurado en Nginx${NC}"
+        fi
     fi
     
     # Verificar que Nginx esté escuchando en 443
@@ -1245,16 +1267,83 @@ test_ssl_connection() {
     local https_test=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 --connect-timeout 5 -k "https://$domain" 2>/dev/null)
     local https_exit=$?
     
-    if [ $https_exit -ne 0 ]; then
+    # Verificar código HTTP - 000 significa problema de conexión
+    if [ "$https_test" = "000" ]; then
         echo -e "  ${RED}✗${NC} No se pudo conectar vía HTTPS"
+        echo -e "    ${YELLOW}Posibles causas:${NC}"
+        echo -e "    • El servidor no está respondiendo en el puerto 443"
+        echo -e "    • Firewall bloqueando la conexión"
+        echo -e "    • El dominio no está apuntando correctamente al servidor"
+        echo -e "    • Nginx no está escuchando en el puerto 443 para este dominio"
         return 1
     fi
     
-    echo -e "  ${GREEN}✓${NC} Conexión HTTPS exitosa (código HTTP: $https_test)"
+    if [ $https_exit -ne 0 ]; then
+        echo -e "  ${RED}✗${NC} Error al conectar vía HTTPS (código de salida: $https_exit)"
+        return 1
+    fi
+    
+    # Verificar códigos HTTP específicos que indican problemas SSL/Cloudflare
+    local has_ssl_issue=false
+    case "$https_test" in
+        526)
+            echo -e "  ${RED}✗${NC} Error Cloudflare 526: Invalid SSL Certificate"
+            echo -e "    ${YELLOW}Diagnóstico:${NC}"
+            echo -e "    • Cloudflare no puede validar el certificado SSL del servidor de origen"
+            echo -e "    • El certificado puede no estar configurado en Nginx"
+            echo -e "    • El certificado puede no coincidir con el dominio"
+            echo -e "    • Cloudflare está en modo 'Full' o 'Full (strict)' pero el servidor no tiene SSL válido"
+            echo -e "    ${CYAN}Solución:${NC} Configurar SSL en Nginx o cambiar Cloudflare a modo 'Flexible'"
+            has_ssl_issue=true
+            ;;
+        502)
+            echo -e "  ${RED}✗${NC} Error 502: Bad Gateway"
+            echo -e "    ${YELLOW}Diagnóstico:${NC}"
+            echo -e "    • Cloudflare no puede conectarse al servidor de origen"
+            echo -e "    • Puede ser un problema de SSL entre Cloudflare y el servidor"
+            echo -e "    • El servidor puede estar caído o no responder"
+            has_ssl_issue=true
+            ;;
+        503)
+            echo -e "  ${YELLOW}⚠${NC} Error 503: Service Unavailable"
+            echo -e "    ${YELLOW}El servidor puede estar sobrecargado o en mantenimiento${NC}"
+            ;;
+        520|521|522|523|524|525)
+            echo -e "  ${RED}✗${NC} Error Cloudflare $https_test"
+            echo -e "    ${YELLOW}Error específico de Cloudflare. Revisa la configuración del servidor de origen.${NC}"
+            has_ssl_issue=true
+            ;;
+        404)
+            echo -e "  ${GREEN}✓${NC} Conexión HTTPS exitosa (código HTTP: 404)"
+            echo -e "    ${CYAN}Nota:${NC} El código 404 es normal si la ruta no existe, pero SSL funciona correctamente"
+            ;;
+        200|201|202|301|302|307|308)
+            echo -e "  ${GREEN}✓${NC} Conexión HTTPS exitosa (código HTTP: $https_test)"
+            ;;
+        *)
+            if [[ "$https_test" =~ ^[45][0-9][0-9]$ ]]; then
+                echo -e "  ${YELLOW}⚠${NC} Conexión HTTPS con código HTTP: $https_test"
+                echo -e "    ${CYAN}Nota:${NC} El servidor responde pero con un código de error HTTP"
+            else
+                echo -e "  ${GREEN}✓${NC} Conexión HTTPS exitosa (código HTTP: $https_test)"
+            fi
+            ;;
+    esac
+    
+    # Si hay un problema SSL detectado por código HTTP, no continuar con verificación SSL
+    if [ "$has_ssl_issue" = true ]; then
+        return 1
+    fi
     
     # Ahora verificar el certificado SSL (sin -k)
     local ssl_verify=$(curl -s -o /dev/null -w "%{ssl_verify_result}" --max-time 10 --connect-timeout 5 "https://$domain" 2>/dev/null)
     local ssl_exit=$?
+    
+    # Obtener más detalles del error SSL si hay problema
+    local ssl_error_detail=""
+    if [ "$ssl_verify" != "0" ] && [ $ssl_exit -eq 0 ]; then
+        ssl_error_detail=$(curl -s -o /dev/null -w "%{ssl_verify_result}" --max-time 10 --connect-timeout 5 "https://$domain" 2>&1 | grep -i "ssl\|certificate\|verify" | head -1)
+    fi
     
     # ssl_verify_result: 0 = éxito, otros valores = error
     if [ $ssl_exit -eq 0 ] && [ "$ssl_verify" = "0" ]; then
@@ -1298,16 +1387,348 @@ test_ssl_connection() {
         echo -e "  ${RED}✗${NC} Certificado SSL tiene problemas"
         if [ "$ssl_verify" != "0" ]; then
             case "$ssl_verify" in
-                1) echo -e "    ${YELLOW}Error: Certificado no verificado${NC}" ;;
-                2) echo -e "    ${YELLOW}Error: No se pudo verificar el certificado${NC}" ;;
-                3) echo -e "    ${YELLOW}Error: Certificado expirado${NC}" ;;
-                4) echo -e "    ${YELLOW}Error: Certificado auto-firmado${NC}" ;;
-                5) echo -e "    ${YELLOW}Error: Certificado no confiable${NC}" ;;
-                *) echo -e "    ${YELLOW}Error de verificación SSL (código: $ssl_verify)${NC}" ;;
+                1) 
+                    echo -e "    ${RED}Error: Certificado no verificado${NC}"
+                    echo -e "    ${YELLOW}Diagnóstico:${NC}"
+                    echo -e "    • El certificado puede no estar correctamente configurado en Nginx"
+                    echo -e "    • El certificado puede no coincidir con el dominio"
+                    echo -e "    • Puede haber un problema con la cadena de certificados"
+                    ;;
+                2) 
+                    echo -e "    ${RED}Error: No se pudo verificar el certificado${NC}"
+                    echo -e "    ${YELLOW}Diagnóstico:${NC}"
+                    echo -e "    • Problema de conectividad durante la verificación"
+                    echo -e "    • El certificado puede estar corrupto"
+                    ;;
+                3) 
+                    echo -e "    ${RED}Error: Certificado expirado${NC}"
+                    echo -e "    ${YELLOW}Diagnóstico:${NC}"
+                    echo -e "    • El certificado ha expirado y necesita renovación"
+                    ;;
+                4) 
+                    echo -e "    ${RED}Error: Certificado auto-firmado${NC}"
+                    echo -e "    ${YELLOW}Diagnóstico:${NC}"
+                    echo -e "    • El certificado no es de una autoridad certificadora confiable"
+                    ;;
+                5) 
+                    echo -e "    ${RED}Error: Certificado no confiable${NC}"
+                    echo -e "    ${YELLOW}Diagnóstico:${NC}"
+                    echo -e "    • Problema con la cadena de confianza del certificado"
+                    ;;
+                *) 
+                    echo -e "    ${RED}Error de verificación SSL (código: $ssl_verify)${NC}"
+                    ;;
             esac
+        fi
+        if [ -n "$ssl_error_detail" ]; then
+            echo -e "    ${CYAN}Detalle adicional: $ssl_error_detail${NC}"
         fi
         return 1
     fi
+}
+
+###############################################################################
+# FUNCIONES DE REPARACIÓN SSL
+###############################################################################
+
+diagnose_ssl_issue() {
+    local domain=$1
+    local config_file=$2
+    
+    local issues=()
+    local issue_descriptions=()
+    
+    # Verificar si certificado existe en Certbot
+    local certbot_has_cert=false
+    if check_certbot_certificates "$domain"; then
+        certbot_has_cert=true
+    else
+        issues+=("no_certbot_cert")
+        issue_descriptions+=("Certificado no encontrado en Certbot")
+    fi
+    
+    # Verificar si SSL está configurado en Nginx
+    local ssl_configured=false
+    local has_ssl_block=false
+    if [ -f "$config_file" ]; then
+        # Verificar si hay bloque server con listen 443
+        if grep -qE "^\s*listen\s+443" "$config_file" 2>/dev/null; then
+            has_ssl_block=true
+        fi
+        
+        # Verificar si hay directiva ssl_certificate
+        if grep -qE "^\s*ssl_certificate\s+" "$config_file" 2>/dev/null; then
+            ssl_configured=true
+        fi
+    fi
+    
+    # Caso especial: Certificado existe en Certbot pero no está configurado en Nginx
+    if [ "$certbot_has_cert" = true ] && [ "$ssl_configured" = false ]; then
+        issues+=("no_nginx_config")
+        if [ "$has_ssl_block" = true ]; then
+            issue_descriptions+=("Certificado existe en Certbot pero SSL no está configurado en bloque HTTPS de Nginx")
+        else
+            issue_descriptions+=("Certificado existe en Certbot pero no hay bloque HTTPS configurado en Nginx")
+        fi
+    elif [ "$ssl_configured" = false ]; then
+        issues+=("no_nginx_config")
+        issue_descriptions+=("SSL no configurado en Nginx")
+    fi
+    
+    # Verificar si los archivos de certificado existen
+    if [ "$ssl_configured" = true ]; then
+        local cert_path=$(grep -E "^\s*ssl_certificate\s+" "$config_file" 2>/dev/null | head -1 | sed 's/.*ssl_certificate\s\+\([^;]*\);.*/\1/' | tr -d ' ')
+        if [ -n "$cert_path" ] && [ ! -f "$cert_path" ]; then
+            issues+=("cert_file_missing")
+            issue_descriptions+=("Archivo de certificado no existe: $cert_path")
+        fi
+        
+        local key_path=$(grep -E "^\s*ssl_certificate_key\s+" "$config_file" 2>/dev/null | head -1 | sed 's/.*ssl_certificate_key\s\+\([^;]*\);.*/\1/' | tr -d ' ')
+        if [ -n "$key_path" ] && [ ! -f "$key_path" ]; then
+            issues+=("key_file_missing")
+            issue_descriptions+=("Archivo de clave no existe: $key_path")
+        fi
+    fi
+    
+    # Verificar expiración
+    local expiry_info=$(get_certificate_expiry_info "$domain")
+    if [ -n "$expiry_info" ]; then
+        IFS='|' read -r days_remaining expiry_formatted expiry_date <<< "$expiry_info"
+        if [ "$days_remaining" -le 0 ]; then
+            issues+=("cert_expired")
+            issue_descriptions+=("Certificado expirado")
+        elif [ "$days_remaining" -lt 30 ]; then
+            issues+=("cert_expiring_soon")
+            issue_descriptions+=("Certificado expira pronto (${days_remaining} días)")
+        fi
+    fi
+    
+    # Retornar issues como string separado por |
+    if [ ${#issues[@]} -gt 0 ]; then
+        echo "${issues[*]}|${issue_descriptions[*]}"
+        return 1
+    else
+        return 0
+    fi
+}
+
+repair_ssl_configuration() {
+    local domain=$1
+    local config_file=$2
+    local issue_type=$3
+    
+    echo -e "\n${CYAN}${BOLD}Intentando reparar: $issue_type${NC}\n"
+    
+    case "$issue_type" in
+        no_nginx_config)
+            echo -e "${CYAN}El certificado existe pero no está configurado en Nginx.${NC}"
+            
+            # Verificar si hay un bloque server con listen 443
+            local has_https_block=false
+            if [ -f "$config_file" ]; then
+                if grep -qE "^\s*listen\s+443" "$config_file" 2>/dev/null; then
+                    has_https_block=true
+                    echo -e "${YELLOW}Se detectó un bloque HTTPS pero sin configuración SSL${NC}"
+                fi
+            fi
+            
+            echo -e "${CYAN}Reconfigurando SSL con Certbot...${NC}"
+            
+            # Obtener email del certificado existente o pedirlo
+            local email=$(sudo certbot certificates 2>/dev/null | grep -A 10 "$domain" | grep "Account" | awk '{print $3}' | head -1)
+            if [ -z "$email" ]; then
+                # Intentar obtener de otros certificados del mismo dominio base
+                local base_domain=$(echo "$domain" | sed 's/^[^.]*\.//')
+                email=$(sudo certbot certificates 2>/dev/null | grep -A 10 "$base_domain" | grep "Account" | awk '{print $3}' | head -1)
+            fi
+            
+            if [ -z "$email" ]; then
+                read -p "Ingresa el email para certificados SSL: " email
+                if [ -z "$email" ]; then
+                    email="admin@$domain"
+                fi
+            fi
+            
+            # Si hay bloque HTTPS pero sin SSL, Certbot puede tener problemas
+            # Intentar primero reconfigurar, si falla, puede necesitarse configuración manual
+            echo -e "${CYAN}Ejecutando Certbot para configurar SSL...${NC}"
+            local certbot_output=$(sudo certbot --nginx -d "$domain" --non-interactive --agree-tos --email "$email" --redirect --keep-until-expiring 2>&1 | tee /tmp/certbot_repair_${domain}.log)
+            local certbot_exit=$?
+            
+            if [ $certbot_exit -eq 0 ]; then
+                echo -e "${GREEN}✓ SSL reconfigurado correctamente${NC}"
+                
+                # Validar y recargar Nginx
+                if sudo nginx -t &> /dev/null; then
+                    sudo systemctl reload nginx 2>/dev/null || sudo nginx -s reload 2>/dev/null
+                    echo -e "${GREEN}✓ Nginx recargado${NC}"
+                    
+                    # Esperar un momento y verificar
+                    sleep 2
+                    echo -e "${CYAN}Verificando configuración después de reparación...${NC}"
+                    verify_ssl_certificate_config "$domain" "$config_file"
+                    
+                    return 0
+                else
+                    echo -e "${RED}✗ Error en configuración de Nginx después de reparación${NC}"
+                    sudo nginx -t
+                    return 1
+                fi
+            else
+                echo -e "${RED}✗ Error al reconfigurar SSL${NC}"
+                echo -e "${YELLOW}Logs del error:${NC}"
+                cat /tmp/certbot_repair_${domain}.log 2>/dev/null | tail -30 | sed 's/^/  /'
+                
+                # Si Certbot falla, puede ser que necesite configuración manual
+                if [ "$has_https_block" = true ]; then
+                    echo -e "\n${YELLOW}Posible solución manual:${NC}"
+                    echo -e "El bloque HTTPS existe pero Certbot no pudo configurarlo automáticamente."
+                    echo -e "Puede ser necesario agregar manualmente las directivas SSL al bloque server."
+                fi
+                
+                return 1
+            fi
+            ;;
+        cert_file_missing|key_file_missing)
+            echo -e "${CYAN}Archivos de certificado faltantes. Reconfigurando SSL...${NC}"
+            repair_ssl_configuration "$domain" "$config_file" "no_nginx_config"
+            ;;
+        cert_expired|cert_expiring_soon)
+            echo -e "${CYAN}Renovando certificado expirado o próximo a expirar...${NC}"
+            
+            # Intentar renovar
+            if sudo certbot renew --cert-name "$domain" --force-renewal 2>&1 | tee /tmp/certbot_renew_${domain}.log; then
+                echo -e "${GREEN}✓ Certificado renovado${NC}"
+                
+                # Reconfigurar en Nginx si es necesario
+                local email=$(sudo certbot certificates 2>/dev/null | grep -A 10 "$domain" | grep "Account" | awk '{print $3}' | head -1)
+                if [ -z "$email" ]; then
+                    email="admin@$domain"
+                fi
+                
+                sudo certbot --nginx -d "$domain" --non-interactive --agree-tos --email "$email" --redirect --keep-until-expiring 2>&1 | tee /tmp/certbot_reconfig_${domain}.log
+                
+                if sudo nginx -t &> /dev/null; then
+                    sudo systemctl reload nginx 2>/dev/null || sudo nginx -s reload 2>/dev/null
+                    echo -e "${GREEN}✓ Nginx recargado${NC}"
+                    return 0
+                else
+                    echo -e "${RED}✗ Error en configuración después de renovación${NC}"
+                    return 1
+                fi
+            else
+                echo -e "${RED}✗ Error al renovar certificado${NC}"
+                cat /tmp/certbot_renew_${domain}.log 2>/dev/null | tail -20
+                return 1
+            fi
+            ;;
+        no_certbot_cert)
+            echo -e "${CYAN}No se encontró certificado en Certbot. Creando nuevo certificado...${NC}"
+            
+            read -p "Ingresa el email para certificados SSL: " email
+            if [ -z "$email" ]; then
+                email="admin@$domain"
+            fi
+            
+            configure_ssl "$domain" "$email"
+            return $?
+            ;;
+        *)
+            echo -e "${YELLOW}No se puede reparar automáticamente: $issue_type${NC}"
+            return 1
+            ;;
+    esac
+}
+
+repair_site_ssl_interactive() {
+    local domain=$1
+    local config_file=$2
+    
+    echo -e "\n${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}${BOLD}Reparación SSL para: $domain${NC}"
+    echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+    
+    # Diagnosticar problemas
+    local diagnosis=$(diagnose_ssl_issue "$domain" "$config_file")
+    local diagnose_exit=$?
+    
+    if [ $diagnose_exit -eq 0 ]; then
+        echo -e "${GREEN}✓ No se detectaron problemas obvios${NC}"
+        echo -e "${CYAN}Verificando conexión HTTPS...${NC}"
+        test_ssl_connection "$domain"
+        return 0
+    fi
+    
+    IFS='|' read -r issues issue_descriptions <<< "$diagnosis"
+    read -ra issue_array <<< "$issues"
+    read -ra desc_array <<< "$issue_descriptions"
+    
+    echo -e "${YELLOW}Problemas detectados:${NC}"
+    for i in "${!issue_array[@]}"; do
+        echo -e "  ${RED}✗${NC} ${desc_array[$i]}"
+    done
+    echo ""
+    
+    echo -e "${CYAN}Opciones de reparación:${NC}"
+    echo -e "  1) Reparar automáticamente todos los problemas"
+    echo -e "  2) Reparar problemas específicos"
+    echo -e "  3) Solo verificar (sin reparar)"
+    echo -e "  4) Cancelar"
+    echo ""
+    read -p "Opción (1-4): " repair_option
+    
+    case "$repair_option" in
+        1)
+            # Reparar todos los problemas
+            for issue in "${issue_array[@]}"; do
+                repair_ssl_configuration "$domain" "$config_file" "$issue"
+            done
+            
+            # Verificar después de reparar
+            echo -e "\n${CYAN}Verificando después de reparación...${NC}"
+            verify_ssl_certificate_config "$domain" "$config_file"
+            test_ssl_connection "$domain"
+            ;;
+        2)
+            # Reparar problemas específicos
+            echo -e "\n${CYAN}Selecciona el problema a reparar:${NC}"
+            for i in "${!issue_array[@]}"; do
+                echo -e "  $((i+1))) ${desc_array[$i]}"
+            done
+            echo ""
+            read -p "Número del problema (o 'a' para todos): " selected_issue
+            
+            if [[ "$selected_issue" =~ ^[Aa]$ ]]; then
+                for issue in "${issue_array[@]}"; do
+                    repair_ssl_configuration "$domain" "$config_file" "$issue"
+                done
+            elif [[ "$selected_issue" =~ ^[0-9]+$ ]] && [ "$selected_issue" -ge 1 ] && [ "$selected_issue" -le ${#issue_array[@]} ]; then
+                local idx=$((selected_issue - 1))
+                repair_ssl_configuration "$domain" "$config_file" "${issue_array[$idx]}"
+            else
+                echo -e "${YELLOW}Opción inválida${NC}"
+                return 1
+            fi
+            
+            # Verificar después de reparar
+            echo -e "\n${CYAN}Verificando después de reparación...${NC}"
+            verify_ssl_certificate_config "$domain" "$config_file"
+            test_ssl_connection "$domain"
+            ;;
+        3)
+            # Solo verificar
+            verify_ssl_certificate_config "$domain" "$config_file"
+            test_ssl_connection "$domain"
+            ;;
+        4)
+            echo -e "${YELLOW}Reparación cancelada${NC}"
+            return 1
+            ;;
+        *)
+            echo -e "${RED}Opción inválida${NC}"
+            return 1
+            ;;
+    esac
 }
 
 verify_all_sites_ssl() {
@@ -1354,6 +1775,7 @@ verify_all_sites_ssl() {
     local valid_count=0
     local invalid_count=0
     local test_failed_count=0
+    local sites_with_issues=()
     
     for site_info in "${sites_to_verify[@]}"; do
         IFS='|' read -r site_file site_name domain <<< "$site_info"
@@ -1363,12 +1785,15 @@ verify_all_sites_ssl() {
         echo -e "${CYAN}Dominio: $domain${NC}"
         echo ""
         
+        local has_issue=false
+        
         # Verificar configuración SSL
         if verify_ssl_certificate_config "$domain" "$site_file"; then
             ((valid_count++))
             echo -e "  ${GREEN}✓ Configuración SSL correcta${NC}"
         else
             ((invalid_count++))
+            has_issue=true
             echo -e "  ${RED}✗ Configuración SSL tiene problemas${NC}"
         fi
         
@@ -1379,7 +1804,13 @@ verify_all_sites_ssl() {
             echo -e "  ${GREEN}✓ Conexión HTTPS funcionando correctamente${NC}"
         else
             ((test_failed_count++))
+            has_issue=true
             echo -e "  ${RED}✗ Problemas con la conexión HTTPS${NC}"
+        fi
+        
+        # Guardar sitio con problemas
+        if [ "$has_issue" = true ]; then
+            sites_with_issues+=("$site_file|$site_name|$domain")
         fi
         
         echo ""
@@ -1440,6 +1871,64 @@ verify_all_sites_ssl() {
         return 0
     else
         echo -e "${YELLOW}${BOLD}⚠ Algunos sitios necesitan atención${NC}\n"
+        
+        # Ofrecer reparación si hay sitios con problemas
+        if [ ${#sites_with_issues[@]} -gt 0 ]; then
+            echo -e "${CYAN}¿Deseas intentar reparar los sitios con problemas?${NC}"
+            echo -e "  1) Reparar todos los sitios automáticamente"
+            echo -e "  2) Reparar sitios específicos"
+            echo -e "  3) No reparar ahora"
+            echo ""
+            read -p "Opción (1-3): " repair_all_option
+            
+            case "$repair_all_option" in
+                1)
+                    # Reparar todos automáticamente
+                    echo -e "\n${CYAN}Reparando todos los sitios con problemas...${NC}\n"
+                    for site_info in "${sites_with_issues[@]}"; do
+                        IFS='|' read -r site_file site_name domain <<< "$site_info"
+                        local diagnosis=$(diagnose_ssl_issue "$domain" "$site_file")
+                        if [ $? -ne 0 ]; then
+                            IFS='|' read -r issues issue_descriptions <<< "$diagnosis"
+                            read -ra issue_array <<< "$issues"
+                            for issue in "${issue_array[@]}"; do
+                                repair_ssl_configuration "$domain" "$site_file" "$issue"
+                            done
+                        fi
+                    done
+                    ;;
+                2)
+                    # Reparar sitios específicos
+                    echo -e "\n${CYAN}Sitios con problemas:${NC}\n"
+                    for i in "${!sites_with_issues[@]}"; do
+                        IFS='|' read -r site_file site_name domain <<< "${sites_with_issues[$i]}"
+                        echo -e "  $((i+1))) $domain ($site_name)"
+                    done
+                    echo ""
+                    read -p "Selecciona el número del sitio a reparar (o 'a' para todos): " selected_site
+                    
+                    if [[ "$selected_site" =~ ^[Aa]$ ]]; then
+                        for site_info in "${sites_with_issues[@]}"; do
+                            IFS='|' read -r site_file site_name domain <<< "$site_info"
+                            repair_site_ssl_interactive "$domain" "$site_file"
+                        done
+                    elif [[ "$selected_site" =~ ^[0-9]+$ ]] && [ "$selected_site" -ge 1 ] && [ "$selected_site" -le ${#sites_with_issues[@]} ]; then
+                        local idx=$((selected_site - 1))
+                        IFS='|' read -r site_file site_name domain <<< "${sites_with_issues[$idx]}"
+                        repair_site_ssl_interactive "$domain" "$site_file"
+                    else
+                        echo -e "${YELLOW}Opción inválida${NC}"
+                    fi
+                    ;;
+                3)
+                    echo -e "${YELLOW}Reparación cancelada${NC}"
+                    ;;
+                *)
+                    echo -e "${YELLOW}Opción inválida${NC}"
+                    ;;
+            esac
+        fi
+        
         return 1
     fi
 }
@@ -2548,6 +3037,162 @@ select_site_to_change_type() {
 }
 
 ###############################################################################
+# FUNCIONES PARA REPARACIÓN SSL INTERACTIVA
+###############################################################################
+
+list_sites_for_ssl_repair() {
+    echo -e "\n${BLUE}${BOLD}${SEPARATOR}${NC}"
+    echo -e "${BLUE}${BOLD}           SITIOS DISPONIBLES PARA REPARACIÓN SSL${NC}"
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}\n"
+    
+    local sites_list=()
+    local index=1
+    
+    # Buscar sitios en sites-available
+    if [ -d "$NGINX_SITES_AVAILABLE" ]; then
+        for site_file in "$NGINX_SITES_AVAILABLE"/*; do
+            if [ -f "$site_file" ] && [[ ! "$site_file" =~ default$ ]]; then
+                local site_name=$(basename "$site_file")
+                local domain=$(get_domain_from_config "$site_file")
+                if [ -n "$domain" ]; then
+                    sites_list+=("$site_file|$site_name|$domain")
+                fi
+            fi
+        done
+    fi
+    
+    # Buscar sitios en conf.d
+    if [ -d "$NGINX_CONF_DIR" ]; then
+        for site_file in "$NGINX_CONF_DIR"/*; do
+            if [ -f "$site_file" ]; then
+                local site_name=$(basename "$site_file")
+                local domain=$(get_domain_from_config "$site_file")
+                if [ -n "$domain" ]; then
+                    sites_list+=("$site_file|$site_name|$domain")
+                fi
+            fi
+        done
+    fi
+    
+    if [ ${#sites_list[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No se encontraron sitios.${NC}\n"
+        return 1
+    fi
+    
+    echo -e "${CYAN}Sitios disponibles:${NC}\n"
+    for i in "${!sites_list[@]}"; do
+        IFS='|' read -r site_file site_name domain <<< "${sites_list[$i]}"
+        
+        # Verificar rápidamente si tiene problemas
+        local diagnosis=$(diagnose_ssl_issue "$domain" "$site_file")
+        local has_issues=$?
+        
+        if [ $has_issues -eq 0 ]; then
+            echo -e "  $((i+1))) $domain ($site_name) ${GREEN}[OK]${NC}"
+        else
+            echo -e "  $((i+1))) $domain ($site_name) ${RED}[PROBLEMAS]${NC}"
+        fi
+    done
+    
+    echo ""
+    read -p "Selecciona el número del sitio a reparar (o 'q' para cancelar): " selection
+    
+    if [[ "$selection" =~ ^[Qq]$ ]]; then
+        echo -e "${YELLOW}Operación cancelada.${NC}\n"
+        return 1
+    fi
+    
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt ${#sites_list[@]} ]; then
+        echo -e "${RED}Selección inválida.${NC}\n"
+        return 1
+    fi
+    
+    local selected_index=$((selection - 1))
+    local selected_site="${sites_list[$selected_index]}"
+    
+    IFS='|' read -r site_file site_name domain <<< "$selected_site"
+    
+    repair_site_ssl_interactive "$domain" "$site_file"
+    return $?
+}
+
+list_sites_for_ssl_repair() {
+    echo -e "\n${BLUE}${BOLD}${SEPARATOR}${NC}"
+    echo -e "${BLUE}${BOLD}           SITIOS DISPONIBLES PARA REPARACIÓN SSL${NC}"
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}\n"
+    
+    local sites_list=()
+    local index=1
+    
+    # Buscar sitios en sites-available
+    if [ -d "$NGINX_SITES_AVAILABLE" ]; then
+        for site_file in "$NGINX_SITES_AVAILABLE"/*; do
+            if [ -f "$site_file" ] && [[ ! "$site_file" =~ default$ ]]; then
+                local site_name=$(basename "$site_file")
+                local domain=$(get_domain_from_config "$site_file")
+                if [ -n "$domain" ]; then
+                    sites_list+=("$site_file|$site_name|$domain")
+                fi
+            fi
+        done
+    fi
+    
+    # Buscar sitios en conf.d
+    if [ -d "$NGINX_CONF_DIR" ]; then
+        for site_file in "$NGINX_CONF_DIR"/*; do
+            if [ -f "$site_file" ]; then
+                local site_name=$(basename "$site_file")
+                local domain=$(get_domain_from_config "$site_file")
+                if [ -n "$domain" ]; then
+                    sites_list+=("$site_file|$site_name|$domain")
+                fi
+            fi
+        done
+    fi
+    
+    if [ ${#sites_list[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No se encontraron sitios.${NC}\n"
+        return 1
+    fi
+    
+    echo -e "${CYAN}Sitios disponibles:${NC}\n"
+    for i in "${!sites_list[@]}"; do
+        IFS='|' read -r site_file site_name domain <<< "${sites_list[$i]}"
+        
+        # Verificar rápidamente si tiene problemas
+        local diagnosis=$(diagnose_ssl_issue "$domain" "$site_file")
+        local has_issues=$?
+        
+        if [ $has_issues -eq 0 ]; then
+            echo -e "  $((i+1))) $domain ($site_name) ${GREEN}[OK]${NC}"
+        else
+            echo -e "  $((i+1))) $domain ($site_name) ${RED}[PROBLEMAS]${NC}"
+        fi
+    done
+    
+    echo ""
+    read -p "Selecciona el número del sitio a reparar (o 'q' para cancelar): " selection
+    
+    if [[ "$selection" =~ ^[Qq]$ ]]; then
+        echo -e "${YELLOW}Operación cancelada.${NC}\n"
+        return 1
+    fi
+    
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt ${#sites_list[@]} ]; then
+        echo -e "${RED}Selección inválida.${NC}\n"
+        return 1
+    fi
+    
+    local selected_index=$((selection - 1))
+    local selected_site="${sites_list[$selected_index]}"
+    
+    IFS='|' read -r site_file site_name domain <<< "$selected_site"
+    
+    repair_site_ssl_interactive "$domain" "$site_file"
+    return $?
+}
+
+###############################################################################
 # FUNCIÓN PRINCIPAL
 ###############################################################################
 
@@ -2562,10 +3207,11 @@ show_main_menu() {
     echo -e "  4) Cambiar tipo de sitio (API ↔ Next.js)"
     echo -e "  5) Estandarizar todos los sitios"
     echo -e "  6) Validar SSL de todos los sitios"
-    echo -e "  7) Solo mostrar información (sin cambios)"
-    echo -e "  8) Salir"
+    echo -e "  7) Reparar SSL de un sitio específico"
+    echo -e "  8) Solo mostrar información (sin cambios)"
+    echo -e "  9) Salir"
     echo ""
-    read -p "Opción (1-8): " main_option
+    read -p "Opción (1-9): " main_option
     
     case $main_option in
         1)
@@ -2587,10 +3233,13 @@ show_main_menu() {
             return 6  # Validar SSL
             ;;
         7)
-            return 7  # Solo información
+            return 7  # Reparar SSL específico
             ;;
         8)
-            return 8  # Salir
+            return 8  # Solo información
+            ;;
+        9)
+            return 9  # Salir
             ;;
         *)
             echo -e "${RED}Opción inválida.${NC}\n"
@@ -2669,11 +3318,16 @@ main() {
                 verify_all_sites_ssl
                 ;;
             7)
+                # Reparar SSL de un sitio específico
+                increment_operation
+                list_sites_for_ssl_repair
+                ;;
+            8)
                 # Solo mostrar información
                 echo -e "\n${GREEN}Información mostrada. No se realizaron cambios.${NC}\n"
                 break
                 ;;
-            8)
+            9)
                 # Salir
                 echo -e "\n${GREEN}Saliendo...${NC}\n"
                 break
