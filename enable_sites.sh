@@ -275,10 +275,10 @@ get_nginx_sites() {
         echo ""
     fi
     
-    # Buscar en conf.d (si existe)
+    # Buscar en conf.d (si existe) - todos los archivos, no solo .conf
     if [ -d "$NGINX_CONF_DIR" ]; then
         echo -e "${CYAN}Sitios en conf.d:${NC}"
-        for site in "$NGINX_CONF_DIR"/*.conf; do
+        for site in "$NGINX_CONF_DIR"/*; do
             if [ -f "$site" ]; then
                 local site_name=$(basename "$site")
                 echo -e "  $site_name ${GREEN}[ACTIVO]${NC}"
@@ -452,15 +452,25 @@ get_container_info() {
 
 check_site_exists() {
     local domain=$1
-    local site_name="${domain}.conf"
     
-    # Verificar en sites-available
+    # Verificar con nombre estándar (solo dominio, sin .conf)
+    if [ -d "$NGINX_SITES_AVAILABLE" ] && [ -f "$NGINX_SITES_AVAILABLE/$domain" ]; then
+        echo "$NGINX_SITES_AVAILABLE/$domain"
+        return 0
+    fi
+    
+    if [ -d "$NGINX_CONF_DIR" ] && [ -f "$NGINX_CONF_DIR/$domain" ]; then
+        echo "$NGINX_CONF_DIR/$domain"
+        return 0
+    fi
+    
+    # Verificar también con .conf (por compatibilidad)
+    local site_name="${domain}.conf"
     if [ -d "$NGINX_SITES_AVAILABLE" ] && [ -f "$NGINX_SITES_AVAILABLE/$site_name" ]; then
         echo "$NGINX_SITES_AVAILABLE/$site_name"
         return 0
     fi
     
-    # Verificar en conf.d
     if [ -d "$NGINX_CONF_DIR" ] && [ -f "$NGINX_CONF_DIR/$site_name" ]; then
         echo "$NGINX_CONF_DIR/$site_name"
         return 0
@@ -477,7 +487,7 @@ check_site_exists() {
     fi
     
     if [ -d "$NGINX_CONF_DIR" ]; then
-        for site_file in "$NGINX_CONF_DIR"/*.conf; do
+        for site_file in "$NGINX_CONF_DIR"/*; do
             if [ -f "$site_file" ] && grep -qE "server_name\s+.*$domain" "$site_file" 2>/dev/null; then
                 echo "$site_file"
                 return 0
@@ -502,8 +512,8 @@ create_nginx_config() {
         return 2  # Código especial para indicar que ya existe
     fi
     
-    # Usar el dominio como nombre del archivo (formato estándar)
-    local site_name="${domain}.conf"
+    # Usar el dominio como nombre del archivo (formato estándar: solo dominio, sin .conf)
+    local site_name="$domain"
     local site_path=""
     
     # Determinar dónde crear el archivo
@@ -821,9 +831,9 @@ list_sites_for_deletion() {
         done
     fi
     
-    # Buscar en conf.d
+    # Buscar en conf.d (todos los archivos, no solo .conf)
     if [ -d "$NGINX_CONF_DIR" ]; then
-        for site_file in "$NGINX_CONF_DIR"/*.conf; do
+        for site_file in "$NGINX_CONF_DIR"/*; do
             if [ -f "$site_file" ]; then
                 local site_name=$(basename "$site_file")
                 local domain=$(get_domain_from_config "$site_file")
@@ -1086,34 +1096,46 @@ delete_site() {
 
 is_standard_name() {
     local site_name=$1
-    # Un nombre estándar es el dominio seguido de .conf (ej: ejemplo.com.conf)
-    # Debe ser exactamente: dominio.conf donde dominio contiene al menos un punto
+    # Un nombre estándar es SOLO el dominio SIN .conf (ej: ejemplo.com)
+    # NO debe terminar en .conf
+    # Debe ser un dominio válido (contiene al menos un punto)
     
-    # Remover .conf para obtener el dominio
-    local domain_part="${site_name%.conf}"
-    
-    # Verificar que termine en .conf
-    if [[ ! "$site_name" =~ \.conf$ ]]; then
+    # Si termina en .conf, NO es estándar (a menos que sea un dominio válido sin palabras de contenedor)
+    if [[ "$site_name" =~ \.conf$ ]]; then
+        # Remover .conf para obtener el dominio
+        local domain_part="${site_name%.conf}"
+        
+        # Verificar que el dominio tenga al menos un punto (formato dominio.com)
+        if [[ ! "$domain_part" =~ \. ]]; then
+            return 1  # No es un dominio válido
+        fi
+        
+        # Verificar que no sea un nombre de contenedor típico
+        if [[ "$domain_part" =~ (container|api-container|service-container|app-container|-container) ]]; then
+            return 1  # Es un nombre de contenedor, no estándar
+        fi
+        
+        # Verificar que no tenga formato de nombre de contenedor (muchos guiones seguidos)
+        if [[ "$domain_part" =~ -.*-.*- ]]; then
+            return 1  # Probablemente es un nombre de contenedor
+        fi
+        
+        # Si tiene .conf pero es un dominio válido sin palabras de contenedor, podría ser estándar
+        # Pero el formato correcto es sin .conf, así que lo marcamos como no estándar para renombrarlo
         return 1
     fi
     
-    # Verificar que el dominio tenga al menos un punto (formato dominio.com)
-    if [[ ! "$domain_part" =~ \. ]]; then
-        return 1
+    # Si NO termina en .conf, verificar que sea un dominio válido
+    if [[ ! "$site_name" =~ \. ]]; then
+        return 1  # No es un dominio válido
     fi
     
-    # Verificar que no sea un nombre de contenedor típico (contiene guiones y palabras como container, api, etc.)
-    if [[ "$domain_part" =~ (container|api-container|service-container|app-container) ]]; then
-        return 1
+    # Verificar que no sea un nombre de contenedor típico
+    if [[ "$site_name" =~ (container|api-container|service-container|app-container|-container) ]]; then
+        return 1  # Es un nombre de contenedor, no estándar
     fi
     
-    # Verificar que no tenga formato de nombre de contenedor (muchos guiones seguidos)
-    if [[ "$domain_part" =~ -.*-.*- ]]; then
-        # Si tiene más de 2 guiones, probablemente es un nombre de contenedor
-        return 1
-    fi
-    
-    # Si pasa todas las verificaciones, es un nombre estándar
+    # Si es un dominio válido sin .conf y sin palabras de contenedor, es estándar
     return 0
 }
 
@@ -1150,7 +1172,7 @@ list_sites_for_rename() {
                 if [ -n "$domain" ]; then
                     echo -e "     Dominio: $domain"
                     if ! is_standard_name "$site_name"; then
-                        echo -e "     ${CYAN}Nombre sugerido: ${domain}.conf${NC}"
+                        echo -e "     ${CYAN}Nombre sugerido: $domain${NC}"
                     fi
                 fi
                 
@@ -1160,9 +1182,9 @@ list_sites_for_rename() {
         done
     fi
     
-    # Buscar en conf.d
+    # Buscar en conf.d (todos los archivos, no solo .conf)
     if [ -d "$NGINX_CONF_DIR" ]; then
-        for site_file in "$NGINX_CONF_DIR"/*.conf; do
+        for site_file in "$NGINX_CONF_DIR"/*; do
             if [ -f "$site_file" ]; then
                 local site_name=$(basename "$site_file")
                 local domain=$(get_domain_from_config "$site_file")
@@ -1178,7 +1200,7 @@ list_sites_for_rename() {
                 if [ -n "$domain" ]; then
                     echo -e "     Dominio: $domain"
                     if ! is_standard_name "$site_name"; then
-                        echo -e "     ${CYAN}Nombre sugerido: ${domain}.conf${NC}"
+                        echo -e "     ${CYAN}Nombre sugerido: $domain${NC}"
                     fi
                 fi
                 
@@ -1332,7 +1354,7 @@ select_site_to_rename() {
         return 1
     fi
     
-    local suggested_name="${domain}.conf"
+    local suggested_name="$domain"
     
     echo -e "\n${YELLOW}${BOLD}Sitio seleccionado:${NC}"
     echo -e "  ${CYAN}Archivo actual:${NC} $site_file"
@@ -1344,15 +1366,16 @@ select_site_to_rename() {
     read -p "¿Deseas renombrar a '$suggested_name'? (s/n): " confirm
     
     if [[ ! "$confirm" =~ ^[Ss]$ ]]; then
-        read -p "Ingresa el nuevo nombre (debe terminar en .conf): " custom_name
+        read -p "Ingresa el nuevo nombre (solo el dominio, sin .conf): " custom_name
         
         if [ -z "$custom_name" ]; then
             echo -e "${RED}Nombre no proporcionado. Operación cancelada.${NC}\n"
             return 1
         fi
         
-        if [[ ! "$custom_name" =~ \.conf$ ]]; then
-            echo -e "${RED}El nombre debe terminar en .conf${NC}\n"
+        # Verificar que sea un dominio válido (contiene al menos un punto)
+        if [[ ! "$custom_name" =~ \. ]]; then
+            echo -e "${RED}El nombre debe ser un dominio válido (debe contener al menos un punto)${NC}\n"
             return 1
         fi
         
@@ -1387,7 +1410,7 @@ standardize_all_sites() {
     fi
     
     if [ -d "$NGINX_CONF_DIR" ]; then
-        for site_file in "$NGINX_CONF_DIR"/*.conf; do
+        for site_file in "$NGINX_CONF_DIR"/*; do
             if [ -f "$site_file" ]; then
                 local site_name=$(basename "$site_file")
                 if ! is_standard_name "$site_name"; then
@@ -1408,7 +1431,7 @@ standardize_all_sites() {
     echo -e "${CYAN}Sitios que serán estandarizados:${NC}\n"
     for site_info in "${sites_to_standardize[@]}"; do
         IFS='|' read -r site_file site_name domain <<< "$site_info"
-        local new_name="${domain}.conf"
+        local new_name="$domain"
         echo -e "  $index) $site_name → $new_name"
         ((index++))
     done
@@ -1426,7 +1449,7 @@ standardize_all_sites() {
     
     for site_info in "${sites_to_standardize[@]}"; do
         IFS='|' read -r site_file site_name domain <<< "$site_info"
-        local new_name="${domain}.conf"
+        local new_name="$domain"
         
         echo -e "\n${CYAN}Estandarizando: $site_name → $new_name${NC}"
         if rename_site "$site_file" "$site_name" "$domain" "$new_name"; then
