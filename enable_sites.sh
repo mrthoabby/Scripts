@@ -27,6 +27,7 @@ NGINX_SITES=()
 SELECTED_CONTAINERS=()
 DELETE_SITES_LIST=()
 RENAME_SITES_LIST=()
+CHANGE_TYPE_SITES_LIST=()
 OPERATION_COUNT=0
 
 # Función para limpiar pantalla cada 3 operaciones
@@ -507,16 +508,31 @@ check_site_exists() {
         done
     fi
     
-    return 1
+        return 1
 }
 
 select_site_type() {
-    echo -e "\n${CYAN}¿Qué tipo de sitio deseas configurar?${NC}"
-    echo -e "  1) API (configuración estándar para backend/API)"
-    echo -e "  2) Web Next.js (configuración optimizada para Next.js/React)"
-    echo -e "  3) Por defecto (API)"
-    echo ""
-    read -t 10 -p "Opción (1-3) [Por defecto: 1]: " site_type_choice
+    echo -e "\n${BLUE}${BOLD}════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}${BOLD}  SELECCIÓN DE TIPO DE SITIO${NC}"
+    echo -e "${BLUE}${BOLD}════════════════════════════════════════════════════════════${NC}\n"
+    echo -e "${CYAN}¿Qué tipo de sitio deseas configurar?${NC}\n"
+    
+    echo -e "${GREEN}1) API/BACKEND${NC}"
+    echo -e "   ${YELLOW}→${NC} Configuración estándar para APIs REST, GraphQL, microservicios"
+    echo -e "   ${YELLOW}→${NC} Proxy reverso básico con soporte WebSockets"
+    echo -e "   ${YELLOW}→${NC} Timeouts: 60 segundos"
+    echo -e "   ${YELLOW}→${NC} Ideal para: Backend APIs, servicios, microservicios\n"
+    
+    echo -e "${GREEN}2) WEB NEXT.JS${NC}"
+    echo -e "   ${YELLOW}→${NC} Configuración optimizada para aplicaciones Next.js/React"
+    echo -e "   ${YELLOW}→${NC} Gzip compression, caché inteligente, soporte ISR"
+    echo -e "   ${YELLOW}→${NC} Timeouts extendidos: 120 segundos (para SSR)"
+    echo -e "   ${YELLOW}→${NC} Buffers aumentados para páginas grandes"
+    echo -e "   ${YELLOW}→${NC} Ideal para: Next.js, React SSR, aplicaciones web modernas\n"
+    
+    echo -e "${CYAN}3) Por defecto (API)${NC}\n"
+    
+    read -p "Opción (1-3) [Por defecto: 1]: " site_type_choice
     
     case $site_type_choice in
         2)
@@ -534,22 +550,22 @@ get_nextjs_config() {
     echo -e "\n${CYAN}${BOLD}Configuración adicional para Next.js:${NC}\n"
     
     # Preguntar por directorio público
-    read -t 30 -p "¿Ruta del directorio público? [Por defecto: /public]: " public_dir
+    read -p "¿Ruta del directorio público? [Por defecto: /public]: " public_dir
     public_dir="${public_dir:-/public}"
     
     # Preguntar por caché de assets estáticos
     echo ""
-    read -t 10 -p "¿Habilitar caché de assets estáticos? (s/n) [Por defecto: s]: " enable_cache
+    read -p "¿Habilitar caché de assets estáticos? (s/n) [Por defecto: s]: " enable_cache
     enable_cache="${enable_cache:-s}"
     
     # Preguntar por tamaño máximo de upload
     echo ""
-    read -t 10 -p "¿Tamaño máximo de upload en MB? [Por defecto: 10]: " max_upload
+    read -p "¿Tamaño máximo de upload en MB? [Por defecto: 10]: " max_upload
     max_upload="${max_upload:-10}"
     
     # Preguntar por ISR (Incremental Static Regeneration)
     echo ""
-    read -t 10 -p "¿Habilitar soporte para ISR (Incremental Static Regeneration)? (s/n) [Por defecto: s]: " enable_isr
+    read -p "¿Habilitar soporte para ISR (Incremental Static Regeneration)? (s/n) [Por defecto: s]: " enable_isr
     enable_isr="${enable_isr:-s}"
     
     echo "$public_dir|$enable_cache|$max_upload|$enable_isr"
@@ -781,6 +797,13 @@ create_nginx_config() {
     # Seleccionar tipo de sitio si no se proporcionó
     if [ -z "$site_type" ]; then
         site_type=$(select_site_type)
+        echo ""
+        if [ "$site_type" = "nextjs" ]; then
+            echo -e "${GREEN}✓ Tipo seleccionado: Web Next.js${NC}"
+        else
+            echo -e "${GREEN}✓ Tipo seleccionado: API/Backend${NC}"
+        fi
+        echo ""
     fi
     
     # Usar el dominio como nombre del archivo (formato estándar: solo dominio, sin .conf)
@@ -800,16 +823,53 @@ create_nginx_config() {
     # Crear configuración según el tipo
     case $site_type in
         nextjs)
-            echo -e "\n${CYAN}Configurando sitio Next.js...${NC}"
+            echo -e "\n${BLUE}${BOLD}════════════════════════════════════════════════════════════${NC}"
+            echo -e "${BLUE}${BOLD}  CONFIGURANDO SITIO WEB NEXT.JS${NC}"
+            echo -e "${BLUE}${BOLD}════════════════════════════════════════════════════════════${NC}"
+            echo -e "${CYAN}Tipo:${NC} Web Application (Next.js/React)"
+            echo -e "${CYAN}Dominio:${NC} $domain"
+            echo -e "${CYAN}Puerto:${NC} $port"
+            echo ""
             local nextjs_options=$(get_nextjs_config "$domain")
             IFS='|' read -r public_dir enable_cache max_upload enable_isr <<< "$nextjs_options"
+            
+            echo -e "${CYAN}Opciones configuradas:${NC}"
+            echo -e "  • Directorio público: $public_dir"
+            echo -e "  • Caché de assets: $([ "$enable_cache" = "s" ] && echo "Habilitado" || echo "Deshabilitado")"
+            echo -e "  • Tamaño máximo upload: ${max_upload}MB"
+            echo -e "  • Soporte ISR: $([ "$enable_isr" = "s" ] && echo "Habilitado" || echo "Deshabilitado")"
+            echo ""
+            
             create_nextjs_config "$site_path" "$domain" "$port" "$public_dir" "$enable_cache" "$max_upload" "$enable_isr"
-            echo -e "${GREEN}✓ Configuración Next.js creada${NC}"
+            echo -e "${GREEN}✓ Configuración Next.js creada exitosamente${NC}"
+            echo -e "${CYAN}Características incluidas:${NC}"
+            echo -e "  • Gzip compression habilitado"
+            echo -e "  • Timeouts extendidos (120s) para SSR"
+            echo -e "  • Buffers aumentados para páginas grandes"
+            echo -e "  • Headers optimizados para Next.js"
+            if [ "$enable_cache" = "s" ]; then
+                echo -e "  • Caché inteligente para assets estáticos"
+            fi
+            if [ "$enable_isr" = "s" ]; then
+                echo -e "  • Soporte para Incremental Static Regeneration"
+            fi
             ;;
         *)
-            echo -e "\n${CYAN}Configurando sitio API...${NC}"
+            echo -e "\n${BLUE}${BOLD}════════════════════════════════════════════════════════════${NC}"
+            echo -e "${BLUE}${BOLD}  CONFIGURANDO SITIO API/BACKEND${NC}"
+            echo -e "${BLUE}${BOLD}════════════════════════════════════════════════════════════${NC}"
+            echo -e "${CYAN}Tipo:${NC} API/Backend (REST API, GraphQL, etc.)"
+            echo -e "${CYAN}Dominio:${NC} $domain"
+            echo -e "${CYAN}Puerto:${NC} $port"
+            echo ""
+            
             create_api_config "$site_path" "$domain" "$port"
-            echo -e "${GREEN}✓ Configuración API creada${NC}"
+            echo -e "${GREEN}✓ Configuración API creada exitosamente${NC}"
+            echo -e "${CYAN}Características incluidas:${NC}"
+            echo -e "  • Proxy reverso estándar"
+            echo -e "  • Headers de proxy configurados"
+            echo -e "  • Timeouts de 60 segundos"
+            echo -e "  • Soporte para WebSockets (upgrade)"
             ;;
     esac
     
@@ -831,6 +891,22 @@ configure_ssl() {
     
     echo -e "\n${CYAN}Configurando SSL para $domain...${NC}"
     
+    # Verificar si ya existe certificado SSL
+    if check_certbot_certificates "$domain"; then
+        echo -e "${GREEN}✓ El sitio ya tiene certificado SSL configurado${NC}"
+        echo -e "${CYAN}Verificando validez del certificado...${NC}"
+        
+        # Verificar si el certificado está configurado en Nginx
+        local certbot_certs=$(sudo certbot certificates 2>/dev/null | grep -A 5 "$domain")
+        if [ -n "$certbot_certs" ]; then
+            echo -e "${GREEN}✓ Certificado SSL válido y configurado${NC}"
+            return 0
+        else
+            echo -e "${YELLOW}⚠ Certificado existe pero puede no estar configurado en Nginx${NC}"
+            echo -e "${CYAN}Intentando reconfigurar...${NC}"
+        fi
+    fi
+    
     # Verificar configuración de Nginx antes de continuar
     if ! sudo nginx -t &> /dev/null; then
         echo -e "${RED}Error: La configuración de Nginx tiene errores.${NC}"
@@ -848,13 +924,16 @@ configure_ssl() {
     fi
     
     # Ejecutar certbot con opciones mejoradas
-    echo -e "${CYAN}Ejecutando Certbot para obtener certificado SSL...${NC}"
-    if sudo certbot --nginx -d "$domain" \
+    echo -e "${CYAN}Ejecutando Certbot para obtener/configurar certificado SSL...${NC}"
+    local certbot_output=$(sudo certbot --nginx -d "$domain" \
         --non-interactive \
         --agree-tos \
         --email "$email" \
         --redirect \
-        --keep-until-expiring 2>&1 | tee /tmp/certbot_${domain}.log; then
+        --keep-until-expiring 2>&1 | tee /tmp/certbot_${domain}.log)
+    local certbot_exit=$?
+    
+    if [ $certbot_exit -eq 0 ]; then
         echo -e "${GREEN}✓ SSL configurado correctamente para $domain${NC}"
         
         # Verificar que la configuración SSL esté correcta
@@ -869,7 +948,9 @@ configure_ssl() {
         fi
     else
         echo -e "${RED}✗ Error al configurar SSL para $domain${NC}"
-        echo -e "${YELLOW}Revisa los logs en /tmp/certbot_${domain}.log${NC}"
+        echo -e "${YELLOW}Logs del error:${NC}"
+        cat /tmp/certbot_${domain}.log 2>/dev/null | tail -20 | sed 's/^/  /'
+        echo -e "${YELLOW}Revisa los logs completos en /tmp/certbot_${domain}.log${NC}"
         return 1
     fi
 }
@@ -1209,13 +1290,18 @@ delete_site() {
             
             if [ "$delete_certs" = true ]; then
                 echo -e "${CYAN}Eliminando certificados SSL...${NC}"
-                if sudo certbot delete --cert-name "$cert_name" --non-interactive 2>/dev/null; then
+                local certbot_output=$(sudo certbot delete --cert-name "$cert_name" --non-interactive 2>&1)
+                local certbot_exit=$?
+                
+                if [ $certbot_exit -eq 0 ]; then
                     echo -e "${GREEN}✓ Certificados SSL eliminados${NC}"
                     success_steps+=("Certificados SSL eliminados")
                 else
-                    echo -e "${YELLOW}⚠ No se pudieron eliminar los certificados automáticamente${NC}"
+                    echo -e "${RED}✗ Error al eliminar certificados SSL${NC}"
+                    echo -e "${YELLOW}Logs del error:${NC}"
+                    echo "$certbot_output" | sed 's/^/  /'
                     echo -e "${YELLOW}  Puedes eliminarlos manualmente con: sudo certbot delete --cert-name $cert_name${NC}"
-                    errors+=("Error al eliminar certificados SSL")
+                    errors+=("Error al eliminar certificados SSL: $certbot_output")
                 fi
             fi
         else
@@ -1304,10 +1390,12 @@ delete_site() {
     fi
     
     if [ ${#errors[@]} -gt 0 ]; then
-        echo -e "\n${RED}Errores encontrados:${NC}"
+        echo -e "\n${RED}${BOLD}Errores encontrados:${NC}"
         for error in "${errors[@]}"; do
-            echo -e "  ✗ $error"
+            echo -e "  ${RED}✗${NC} $error"
         done
+        echo ""
+        echo -e "${YELLOW}Para más detalles, revisa los logs arriba.${NC}"
         return 1
     else
         echo -e "\n${GREEN}${BOLD}✓ Sitio eliminado correctamente${NC}\n"
@@ -1693,6 +1781,263 @@ standardize_all_sites() {
 }
 
 ###############################################################################
+# FUNCIONES PARA CAMBIAR TIPO DE SITIO
+###############################################################################
+
+get_site_type_from_config() {
+    local config_file=$1
+    if [ -f "$config_file" ]; then
+        # Buscar comentario que indique el tipo
+        if grep -q "# Tipo: Next.js" "$config_file" 2>/dev/null || grep -q "# Tipo: Next" "$config_file" 2>/dev/null || grep -q "# Configuración para Next.js" "$config_file" 2>/dev/null; then
+            echo "nextjs"
+        elif grep -q "# Tipo: API" "$config_file" 2>/dev/null || grep -q "# Configuración para API" "$config_file" 2>/dev/null; then
+            echo "api"
+        else
+            # Detectar por características del archivo
+            # Next.js tiene: gzip, client_max_body_size, _next, X-Forwarded-Host
+            if grep -q "gzip on" "$config_file" 2>/dev/null && grep -q "client_max_body_size" "$config_file" 2>/dev/null && grep -q "X-Forwarded-Host" "$config_file" 2>/dev/null; then
+                echo "nextjs"
+            else
+                echo "api"  # Por defecto
+            fi
+        fi
+    else
+        echo "api"
+    fi
+}
+
+list_sites_for_type_change() {
+    echo -e "\n${BLUE}${BOLD}${SEPARATOR}${NC}"
+    echo -e "${BLUE}${BOLD}           SITIOS DISPONIBLES PARA CAMBIAR TIPO${NC}"
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}\n"
+    
+    local sites_list=()
+    local index=1
+    
+    # Buscar en sites-available
+    if [ -d "$NGINX_SITES_AVAILABLE" ]; then
+        for site_file in "$NGINX_SITES_AVAILABLE"/*; do
+            if [ -f "$site_file" ] && [[ ! "$site_file" =~ default$ ]]; then
+                local site_name=$(basename "$site_file")
+                local domain=$(get_domain_from_config "$site_file")
+                local current_type=$(get_site_type_from_config "$site_file")
+                local enabled=""
+                
+                if [ -L "$NGINX_SITES_ENABLED/$site_name" ]; then
+                    enabled="${GREEN}[ACTIVO]${NC}"
+                else
+                    enabled="${RED}[INACTIVO]${NC}"
+                fi
+                
+                local type_display=""
+                if [ "$current_type" = "nextjs" ]; then
+                    type_display="${CYAN}[Next.js]${NC}"
+                else
+                    type_display="${YELLOW}[API]${NC}"
+                fi
+                
+                echo -e "  $index) $site_name $enabled $type_display"
+                if [ -n "$domain" ]; then
+                    echo -e "     Dominio: $domain"
+                fi
+                
+                sites_list+=("$site_file|$site_name|$domain|$current_type")
+                ((index++))
+            fi
+        done
+    fi
+    
+    # Buscar en conf.d
+    if [ -d "$NGINX_CONF_DIR" ]; then
+        for site_file in "$NGINX_CONF_DIR"/*; do
+            if [ -f "$site_file" ]; then
+                local site_name=$(basename "$site_file")
+                local domain=$(get_domain_from_config "$site_file")
+                local current_type=$(get_site_type_from_config "$site_file")
+                
+                local type_display=""
+                if [ "$current_type" = "nextjs" ]; then
+                    type_display="${CYAN}[Next.js]${NC}"
+                else
+                    type_display="${YELLOW}[API]${NC}"
+                fi
+                
+                echo -e "  $index) $site_name ${GREEN}[ACTIVO]${NC} $type_display"
+                if [ -n "$domain" ]; then
+                    echo -e "     Dominio: $domain"
+                fi
+                
+                sites_list+=("$site_file|$site_name|$domain|$current_type")
+                ((index++))
+            fi
+        done
+    fi
+    
+    if [ ${#sites_list[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No se encontraron sitios para cambiar tipo.${NC}\n"
+        return 1
+    fi
+    
+    echo ""
+    echo -e "${CYAN}Total de sitios encontrados: ${#sites_list[@]}${NC}\n"
+    
+    CHANGE_TYPE_SITES_LIST=("${sites_list[@]}")
+    return 0
+}
+
+change_site_type() {
+    local site_file=$1
+    local site_name=$2
+    local domain=$3
+    local current_type=$4
+    local new_type=$5
+    
+    echo -e "\n${CYAN}${BOLD}Cambiando tipo de sitio:${NC}"
+    echo -e "  ${CYAN}Archivo:${NC} $site_file"
+    echo -e "  ${CYAN}Dominio:${NC} $domain"
+    echo -e "  ${CYAN}Tipo actual:${NC} $([ "$current_type" = "nextjs" ] && echo "Next.js" || echo "API")"
+    echo -e "  ${CYAN}Tipo nuevo:${NC} $([ "$new_type" = "nextjs" ] && echo "Next.js" || echo "API")"
+    echo ""
+    
+    # Obtener puerto del archivo actual
+    local port=$(grep -E "proxy_pass\s+http://localhost:" "$site_file" 2>/dev/null | head -1 | grep -oE "localhost:[0-9]+" | cut -d: -f2)
+    
+    if [ -z "$port" ]; then
+        echo -e "${RED}Error: No se pudo determinar el puerto del sitio${NC}"
+        read -p "Ingresa el puerto del sitio: " port
+        if [ -z "$port" ] || ! [[ "$port" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}Puerto inválido${NC}"
+            return 1
+        fi
+    fi
+    
+    # Crear nueva configuración según el tipo
+    local temp_config="/tmp/nginx_config_${site_name}_$$"
+    
+    case $new_type in
+        nextjs)
+            echo -e "${CYAN}Obteniendo configuración para Next.js...${NC}"
+            local nextjs_options=$(get_nextjs_config "$domain")
+            IFS='|' read -r public_dir enable_cache max_upload enable_isr <<< "$nextjs_options"
+            create_nextjs_config "$temp_config" "$domain" "$port" "$public_dir" "$enable_cache" "$max_upload" "$enable_isr"
+            ;;
+        *)
+            echo -e "${CYAN}Obteniendo configuración para API...${NC}"
+            create_api_config "$temp_config" "$domain" "$port"
+            ;;
+    esac
+    
+    # Hacer backup del archivo original
+    local backup_file="${site_file}.backup.$(date +%Y%m%d_%H%M%S)"
+    sudo cp "$site_file" "$backup_file" 2>/dev/null
+    echo -e "${CYAN}Backup creado: $backup_file${NC}"
+    
+    # Reemplazar el archivo
+    if sudo mv "$temp_config" "$site_file" 2>/dev/null; then
+        echo -e "${GREEN}✓ Configuración actualizada${NC}"
+        
+        # Validar configuración
+        if sudo nginx -t &> /dev/null; then
+            echo -e "${GREEN}✓ Configuración válida${NC}"
+            
+            # Recargar Nginx
+            if sudo systemctl reload nginx 2>/dev/null || sudo nginx -s reload 2>/dev/null; then
+                echo -e "${GREEN}✓ Nginx recargado${NC}"
+                
+                # Verificar SSL (no recrear si ya existe)
+                if check_certbot_certificates "$domain"; then
+                    echo -e "${GREEN}✓ El sitio ya tiene certificado SSL configurado${NC}"
+                else
+                    echo -e "${YELLOW}⚠ El sitio no tiene certificado SSL${NC}"
+                    read -p "¿Deseas configurar SSL ahora? (s/n): " configure_ssl_now
+                    if [[ "$configure_ssl_now" =~ ^[Ss]$ ]]; then
+                        read -p "Ingresa el email para certificados SSL: " email
+                        if [ -z "$email" ]; then
+                            email="admin@$domain"
+                        fi
+                        configure_ssl "$domain" "$email"
+                    fi
+                fi
+                
+                echo -e "\n${GREEN}${BOLD}✓ Tipo de sitio cambiado exitosamente${NC}\n"
+                return 0
+            else
+                echo -e "${RED}✗ Error al recargar Nginx${NC}"
+                # Restaurar backup
+                sudo mv "$backup_file" "$site_file" 2>/dev/null
+                echo -e "${YELLOW}Configuración restaurada desde backup${NC}"
+                return 1
+            fi
+        else
+            echo -e "${RED}✗ Error en la configuración de Nginx${NC}"
+            sudo nginx -t
+            # Restaurar backup
+            sudo mv "$backup_file" "$site_file" 2>/dev/null
+            echo -e "${YELLOW}Configuración restaurada desde backup${NC}"
+            return 1
+        fi
+    else
+        echo -e "${RED}✗ Error al actualizar configuración${NC}"
+        return 1
+    fi
+}
+
+select_site_to_change_type() {
+    if [ ${#CHANGE_TYPE_SITES_LIST[@]} -eq 0 ]; then
+        return 1
+    fi
+    
+    read -p "Selecciona el número del sitio a cambiar (o 'q' para cancelar): " selection
+    
+    if [[ "$selection" =~ ^[Qq]$ ]]; then
+        echo -e "${YELLOW}Operación cancelada.${NC}\n"
+        return 1
+    fi
+    
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt ${#CHANGE_TYPE_SITES_LIST[@]} ]; then
+        echo -e "${RED}Selección inválida.${NC}\n"
+        return 1
+    fi
+    
+    local selected_index=$((selection - 1))
+    local selected_site="${CHANGE_TYPE_SITES_LIST[$selected_index]}"
+    
+    IFS='|' read -r site_file site_name domain current_type <<< "$selected_site"
+    
+    echo -e "\n${YELLOW}${BOLD}Sitio seleccionado:${NC}"
+    echo -e "  ${CYAN}Archivo:${NC} $site_file"
+    echo -e "  ${CYAN}Nombre:${NC} $site_name"
+    echo -e "  ${CYAN}Dominio:${NC} $domain"
+    echo -e "  ${CYAN}Tipo actual:${NC} $([ "$current_type" = "nextjs" ] && echo "Next.js" || echo "API")"
+    echo ""
+    
+    # Determinar tipo nuevo
+    local new_type=""
+    if [ "$current_type" = "nextjs" ]; then
+        echo -e "${CYAN}El sitio actualmente es Next.js. ¿Cambiar a API?${NC}"
+        read -p "Cambiar a API? (s/n): " confirm_change
+        if [[ "$confirm_change" =~ ^[Ss]$ ]]; then
+            new_type="api"
+        else
+            echo -e "${YELLOW}Operación cancelada.${NC}\n"
+            return 1
+        fi
+    else
+        echo -e "${CYAN}El sitio actualmente es API. ¿Cambiar a Next.js?${NC}"
+        read -p "Cambiar a Next.js? (s/n): " confirm_change
+        if [[ "$confirm_change" =~ ^[Ss]$ ]]; then
+            new_type="nextjs"
+        else
+            echo -e "${YELLOW}Operación cancelada.${NC}\n"
+            return 1
+        fi
+    fi
+    
+    change_site_type "$site_file" "$site_name" "$domain" "$current_type" "$new_type"
+    return $?
+}
+
+###############################################################################
 # FUNCIÓN PRINCIPAL
 ###############################################################################
 
@@ -1704,11 +2049,12 @@ show_main_menu() {
     echo -e "  1) Configurar nuevos sitios para contenedores Docker"
     echo -e "  2) Eliminar un sitio existente"
     echo -e "  3) Renombrar un sitio"
-    echo -e "  4) Estandarizar todos los sitios"
-    echo -e "  5) Solo mostrar información (sin cambios)"
-    echo -e "  6) Salir"
+    echo -e "  4) Cambiar tipo de sitio (API ↔ Next.js)"
+    echo -e "  5) Estandarizar todos los sitios"
+    echo -e "  6) Solo mostrar información (sin cambios)"
+    echo -e "  7) Salir"
     echo ""
-    read -p "Opción (1-6): " main_option
+    read -p "Opción (1-7): " main_option
     
     case $main_option in
         1)
@@ -1721,13 +2067,16 @@ show_main_menu() {
             return 3  # Renombrar sitio
             ;;
         4)
-            return 4  # Estandarizar sitios
+            return 4  # Cambiar tipo de sitio
             ;;
         5)
-            return 5  # Solo información
+            return 5  # Estandarizar sitios
             ;;
         6)
-            return 6  # Salir
+            return 6  # Solo información
+            ;;
+        7)
+            return 7  # Salir
             ;;
         *)
             echo -e "${RED}Opción inválida.${NC}\n"
@@ -1789,16 +2138,23 @@ main() {
                 fi
                 ;;
             4)
+                # Cambiar tipo de sitio
+                increment_operation
+                if list_sites_for_type_change; then
+                    select_site_to_change_type
+                fi
+                ;;
+            5)
                 # Estandarizar todos los sitios
                 increment_operation
                 standardize_all_sites
                 ;;
-            5)
+            6)
                 # Solo mostrar información
                 echo -e "\n${GREEN}Información mostrada. No se realizaron cambios.${NC}\n"
                 break
                 ;;
-            6)
+            7)
                 # Salir
                 echo -e "\n${GREEN}Saliendo...${NC}\n"
                 break
