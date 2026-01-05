@@ -557,33 +557,35 @@ select_site_type() {
 get_nextjs_config() {
     local domain=$1
     
-    echo -e "\n${CYAN}${BOLD}Configuración adicional para Next.js:${NC}\n"
+    # Mostrar mensajes en stderr para que no interfieran con la captura del valor
+    echo -e "\n${CYAN}${BOLD}Configuración adicional para Next.js:${NC}\n" >&2
     
     # Preguntar por directorio público
-    read -p "¿Ruta del directorio público? [Por defecto: /public]: " public_dir
+    read -p "¿Ruta del directorio público? [Por defecto: /public]: " public_dir >&2
     public_dir="${public_dir:-/public}"
     
     # Preguntar por caché de assets estáticos
-    echo ""
-    read -p "¿Habilitar caché de assets estáticos? (s/n) [Por defecto: s]: " enable_cache
+    echo "" >&2
+    read -p "¿Habilitar caché de assets estáticos? (s/n) [Por defecto: s]: " enable_cache >&2
     enable_cache="${enable_cache:-s}"
     
     # Preguntar por tamaño máximo de upload
-    echo ""
-    read -p "¿Tamaño máximo de upload en MB? [Por defecto: 10]: " max_upload
+    echo "" >&2
+    read -p "¿Tamaño máximo de upload en MB? [Por defecto: 10]: " max_upload >&2
     max_upload="${max_upload:-10}"
     
     # Validar que sea un número válido
     if ! [[ "$max_upload" =~ ^[0-9]+$ ]] || [ "$max_upload" -le 0 ]; then
-        echo -e "${YELLOW}Valor inválido, usando 10MB por defecto${NC}"
+        echo -e "${YELLOW}Valor inválido, usando 10MB por defecto${NC}" >&2
         max_upload="10"
     fi
     
     # Preguntar por ISR (Incremental Static Regeneration)
-    echo ""
-    read -p "¿Habilitar soporte para ISR (Incremental Static Regeneration)? (s/n) [Por defecto: s]: " enable_isr
+    echo "" >&2
+    read -p "¿Habilitar soporte para ISR (Incremental Static Regeneration)? (s/n) [Por defecto: s]: " enable_isr >&2
     enable_isr="${enable_isr:-s}"
     
+    # Retornar solo los valores separados por |
     echo "$public_dir|$enable_cache|$max_upload|$enable_isr"
 }
 
@@ -658,6 +660,12 @@ create_nextjs_config() {
     local enable_cache=$5
     local max_upload=$6
     local enable_isr=$7
+    
+    # Validar y sanitizar max_upload
+    if [ -z "$max_upload" ] || ! [[ "$max_upload" =~ ^[0-9]+$ ]] || [ "$max_upload" -le 0 ]; then
+        echo -e "${YELLOW}⚠ Valor inválido para max_upload ($max_upload), usando 10MB por defecto${NC}" >&2
+        max_upload="10"
+    fi
     
     local cache_config=""
     local isr_config=""
@@ -881,7 +889,27 @@ create_nginx_config() {
             echo -e "${CYAN}Puerto:${NC} $port"
             echo ""
             local nextjs_options=$(get_nextjs_config "$domain")
+            
+            # Limpiar y leer los valores
+            nextjs_options=$(echo "$nextjs_options" | tr -d '\n\r')
             IFS='|' read -r public_dir enable_cache max_upload enable_isr <<< "$nextjs_options"
+            
+            # Limpiar espacios de cada variable
+            public_dir=$(echo "$public_dir" | tr -d ' ')
+            enable_cache=$(echo "$enable_cache" | tr -d ' ')
+            max_upload=$(echo "$max_upload" | tr -d ' ')
+            enable_isr=$(echo "$enable_isr" | tr -d ' ')
+            
+            # Validar max_upload antes de usar
+            if [ -z "$max_upload" ] || ! [[ "$max_upload" =~ ^[0-9]+$ ]] || [ "$max_upload" -le 0 ]; then
+                echo -e "${YELLOW}Valor inválido para max_upload ($max_upload), usando 10MB por defecto${NC}"
+                max_upload="10"
+            fi
+            
+            # Asegurar valores por defecto si están vacíos
+            public_dir="${public_dir:-/public}"
+            enable_cache="${enable_cache:-s}"
+            enable_isr="${enable_isr:-s}"
             
             echo -e "${CYAN}Opciones configuradas:${NC}"
             echo -e "  • Directorio público: $public_dir"
@@ -1968,13 +1996,27 @@ change_site_type() {
         nextjs)
             echo -e "${CYAN}Obteniendo configuración para Next.js...${NC}"
             local nextjs_options=$(get_nextjs_config "$domain")
+            
+            # Limpiar y leer los valores
+            nextjs_options=$(echo "$nextjs_options" | tr -d '\n\r')
             IFS='|' read -r public_dir enable_cache max_upload enable_isr <<< "$nextjs_options"
             
+            # Limpiar espacios de cada variable
+            public_dir=$(echo "$public_dir" | tr -d ' ')
+            enable_cache=$(echo "$enable_cache" | tr -d ' ')
+            max_upload=$(echo "$max_upload" | tr -d ' ')
+            enable_isr=$(echo "$enable_isr" | tr -d ' ')
+            
             # Validar max_upload antes de usar
-            if ! [[ "$max_upload" =~ ^[0-9]+$ ]] || [ -z "$max_upload" ] || [ "$max_upload" -le 0 ]; then
-                echo -e "${YELLOW}Valor inválido para max_upload, usando 10MB por defecto${NC}"
+            if [ -z "$max_upload" ] || ! [[ "$max_upload" =~ ^[0-9]+$ ]] || [ "$max_upload" -le 0 ]; then
+                echo -e "${YELLOW}Valor inválido para max_upload ($max_upload), usando 10MB por defecto${NC}"
                 max_upload="10"
             fi
+            
+            # Asegurar valores por defecto si están vacíos
+            public_dir="${public_dir:-/public}"
+            enable_cache="${enable_cache:-s}"
+            enable_isr="${enable_isr:-s}"
             
             create_nextjs_config "$temp_config" "$domain" "$port" "$public_dir" "$enable_cache" "$max_upload" "$enable_isr"
             ;;
