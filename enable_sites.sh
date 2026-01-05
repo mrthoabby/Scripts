@@ -26,6 +26,7 @@ DOCKER_CONTAINERS=()
 NGINX_SITES=()
 SELECTED_CONTAINERS=()
 DELETE_SITES_LIST=()
+RENAME_SITES_LIST=()
 
 ###############################################################################
 # FUNCIONES DE VALIDACIÓN
@@ -449,12 +450,60 @@ get_container_info() {
     echo ""
 }
 
+check_site_exists() {
+    local domain=$1
+    local site_name="${domain}.conf"
+    
+    # Verificar en sites-available
+    if [ -d "$NGINX_SITES_AVAILABLE" ] && [ -f "$NGINX_SITES_AVAILABLE/$site_name" ]; then
+        echo "$NGINX_SITES_AVAILABLE/$site_name"
+        return 0
+    fi
+    
+    # Verificar en conf.d
+    if [ -d "$NGINX_CONF_DIR" ] && [ -f "$NGINX_CONF_DIR/$site_name" ]; then
+        echo "$NGINX_CONF_DIR/$site_name"
+        return 0
+    fi
+    
+    # Buscar por dominio en todos los archivos
+    if [ -d "$NGINX_SITES_AVAILABLE" ]; then
+        for site_file in "$NGINX_SITES_AVAILABLE"/*; do
+            if [ -f "$site_file" ] && grep -qE "server_name\s+.*$domain" "$site_file" 2>/dev/null; then
+                echo "$site_file"
+                return 0
+            fi
+        done
+    fi
+    
+    if [ -d "$NGINX_CONF_DIR" ]; then
+        for site_file in "$NGINX_CONF_DIR"/*.conf; do
+            if [ -f "$site_file" ] && grep -qE "server_name\s+.*$domain" "$site_file" 2>/dev/null; then
+                echo "$site_file"
+                return 0
+            fi
+        done
+    fi
+    
+    return 1
+}
+
 create_nginx_config() {
     local container_name=$1
     local domain=$2
     local port=$3
     
-    local site_name="${container_name}.conf"
+    # Verificar si el sitio ya existe
+    local existing_site=$(check_site_exists "$domain")
+    if [ -n "$existing_site" ]; then
+        echo -e "${YELLOW}⚠ El sitio para el dominio '$domain' ya existe:${NC}"
+        echo -e "${CYAN}  Archivo: $existing_site${NC}"
+        echo -e "${YELLOW}  No se creará una nueva configuración.${NC}"
+        return 2  # Código especial para indicar que ya existe
+    fi
+    
+    # Usar el dominio como nombre del archivo (formato estándar)
+    local site_name="${domain}.conf"
     local site_path=""
     
     # Determinar dónde crear el archivo
@@ -641,7 +690,10 @@ process_containers() {
         fi
         
         # Crear configuración de Nginx
-        if create_nginx_config "$name" "$domain" "$port"; then
+        create_nginx_config "$name" "$domain" "$port"
+        local create_result=$?
+        
+        if [ "$create_result" -eq 0 ]; then
             # Recargar Nginx
             if sudo nginx -t &> /dev/null; then
                 sudo systemctl reload nginx 2>/dev/null || sudo nginx -s reload 2>/dev/null
@@ -658,6 +710,22 @@ process_containers() {
             else
                 errors+=("$name: Error al configurar SSL")
                 ((error_count++))
+            fi
+        elif [ "$create_result" -eq 2 ]; then
+            # Sitio ya existe, solo verificar/configurar SSL si es necesario
+            echo -e "${CYAN}Verificando configuración SSL...${NC}"
+            if check_certbot_certificates "$domain"; then
+                echo -e "${GREEN}✓ El sitio ya tiene SSL configurado${NC}"
+                ((success_count++))
+            else
+                echo -e "${YELLOW}⚠ El sitio existe pero no tiene SSL. Configurando SSL...${NC}"
+                if configure_ssl "$domain" "$email"; then
+                    echo -e "${GREEN}✓ SSL configurado para sitio existente${NC}"
+                    ((success_count++))
+                else
+                    errors+=("$name: Error al configurar SSL en sitio existente")
+                    ((error_count++))
+                fi
             fi
         else
             errors+=("$name: Error al crear configuración")
@@ -1013,6 +1081,370 @@ delete_site() {
 }
 
 ###############################################################################
+# FUNCIONES DE RENOMBRAR Y ESTANDARIZAR
+###############################################################################
+
+is_standard_name() {
+    local site_name=$1
+    # Un nombre estándar es el dominio seguido de .conf (ej: ejemplo.com.conf)
+    # Debe ser exactamente: dominio.conf donde dominio contiene al menos un punto
+    
+    # Remover .conf para obtener el dominio
+    local domain_part="${site_name%.conf}"
+    
+    # Verificar que termine en .conf
+    if [[ ! "$site_name" =~ \.conf$ ]]; then
+        return 1
+    fi
+    
+    # Verificar que el dominio tenga al menos un punto (formato dominio.com)
+    if [[ ! "$domain_part" =~ \. ]]; then
+        return 1
+    fi
+    
+    # Verificar que no sea un nombre de contenedor típico (contiene guiones y palabras como container, api, etc.)
+    if [[ "$domain_part" =~ (container|api-container|service-container|app-container) ]]; then
+        return 1
+    fi
+    
+    # Verificar que no tenga formato de nombre de contenedor (muchos guiones seguidos)
+    if [[ "$domain_part" =~ -.*-.*- ]]; then
+        # Si tiene más de 2 guiones, probablemente es un nombre de contenedor
+        return 1
+    fi
+    
+    # Si pasa todas las verificaciones, es un nombre estándar
+    return 0
+}
+
+list_sites_for_rename() {
+    echo -e "\n${BLUE}${BOLD}${SEPARATOR}${NC}"
+    echo -e "${BLUE}${BOLD}           SITIOS DISPONIBLES PARA RENOMBRAR${NC}"
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}\n"
+    
+    local sites_list=()
+    local index=1
+    
+    # Buscar en sites-available
+    if [ -d "$NGINX_SITES_AVAILABLE" ]; then
+        for site_file in "$NGINX_SITES_AVAILABLE"/*; do
+            if [ -f "$site_file" ] && [[ ! "$site_file" =~ default$ ]]; then
+                local site_name=$(basename "$site_file")
+                local domain=$(get_domain_from_config "$site_file")
+                local enabled=""
+                local standard=""
+                
+                if [ -L "$NGINX_SITES_ENABLED/$site_name" ]; then
+                    enabled="${GREEN}[ACTIVO]${NC}"
+                else
+                    enabled="${RED}[INACTIVO]${NC}"
+                fi
+                
+                if is_standard_name "$site_name"; then
+                    standard="${GREEN}[ESTÁNDAR]${NC}"
+                else
+                    standard="${YELLOW}[NO ESTÁNDAR]${NC}"
+                fi
+                
+                echo -e "  $index) $site_name $enabled $standard"
+                if [ -n "$domain" ]; then
+                    echo -e "     Dominio: $domain"
+                    if ! is_standard_name "$site_name"; then
+                        echo -e "     ${CYAN}Nombre sugerido: ${domain}.conf${NC}"
+                    fi
+                fi
+                
+                sites_list+=("$site_file|$site_name|$domain")
+                ((index++))
+            fi
+        done
+    fi
+    
+    # Buscar en conf.d
+    if [ -d "$NGINX_CONF_DIR" ]; then
+        for site_file in "$NGINX_CONF_DIR"/*.conf; do
+            if [ -f "$site_file" ]; then
+                local site_name=$(basename "$site_file")
+                local domain=$(get_domain_from_config "$site_file")
+                local standard=""
+                
+                if is_standard_name "$site_name"; then
+                    standard="${GREEN}[ESTÁNDAR]${NC}"
+                else
+                    standard="${YELLOW}[NO ESTÁNDAR]${NC}"
+                fi
+                
+                echo -e "  $index) $site_name ${GREEN}[ACTIVO]${NC} $standard"
+                if [ -n "$domain" ]; then
+                    echo -e "     Dominio: $domain"
+                    if ! is_standard_name "$site_name"; then
+                        echo -e "     ${CYAN}Nombre sugerido: ${domain}.conf${NC}"
+                    fi
+                fi
+                
+                sites_list+=("$site_file|$site_name|$domain")
+                ((index++))
+            fi
+        done
+    fi
+    
+    if [ ${#sites_list[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No se encontraron sitios para renombrar.${NC}\n"
+        return 1
+    fi
+    
+    echo ""
+    echo -e "${CYAN}Total de sitios encontrados: ${#sites_list[@]}${NC}\n"
+    
+    RENAME_SITES_LIST=("${sites_list[@]}")
+    return 0
+}
+
+rename_site() {
+    local old_file=$1
+    local old_name=$2
+    local domain=$3
+    local new_name=$4
+    
+    echo -e "\n${CYAN}${BOLD}Renombrando sitio:${NC}"
+    echo -e "  ${CYAN}Archivo actual:${NC} $old_file"
+    echo -e "  ${CYAN}Nombre actual:${NC} $old_name"
+    echo -e "  ${CYAN}Nuevo nombre:${NC} $new_name"
+    echo ""
+    
+    local errors=()
+    local success_steps=()
+    
+    # Determinar directorio base
+    local base_dir=""
+    if [[ "$old_file" == "$NGINX_SITES_AVAILABLE"/* ]]; then
+        base_dir="$NGINX_SITES_AVAILABLE"
+    elif [[ "$old_file" == "$NGINX_CONF_DIR"/* ]]; then
+        base_dir="$NGINX_CONF_DIR"
+    else
+        echo -e "${RED}Error: No se pudo determinar el directorio base${NC}"
+        return 1
+    fi
+    
+    local new_file="$base_dir/$new_name"
+    
+    # Verificar si el nuevo nombre ya existe
+    if [ -f "$new_file" ]; then
+        echo -e "${RED}Error: El archivo $new_name ya existe${NC}"
+        return 1
+    fi
+    
+    # 1. Renombrar el archivo
+    echo -e "${CYAN}Renombrando archivo...${NC}"
+    if sudo mv "$old_file" "$new_file" 2>/dev/null; then
+        echo -e "${GREEN}✓ Archivo renombrado${NC}"
+        success_steps+=("Archivo renombrado")
+    else
+        echo -e "${RED}✗ Error al renombrar archivo${NC}"
+        errors+=("Error al renombrar archivo")
+        return 1
+    fi
+    
+    # 2. Actualizar enlace simbólico si existe
+    if [ -d "$NGINX_SITES_ENABLED" ] && [ -L "$NGINX_SITES_ENABLED/$old_name" ]; then
+        echo -e "${CYAN}Actualizando enlace simbólico...${NC}"
+        sudo rm "$NGINX_SITES_ENABLED/$old_name" 2>/dev/null
+        if sudo ln -s "$new_file" "$NGINX_SITES_ENABLED/$new_name" 2>/dev/null; then
+            echo -e "${GREEN}✓ Enlace simbólico actualizado${NC}"
+            success_steps+=("Enlace simbólico actualizado")
+        else
+            echo -e "${YELLOW}⚠ Advertencia: No se pudo actualizar el enlace simbólico${NC}"
+            errors+=("Error al actualizar enlace simbólico")
+        fi
+    fi
+    
+    # 3. Validar y recargar Nginx
+    echo -e "${CYAN}Validando configuración de Nginx...${NC}"
+    if sudo nginx -t &> /dev/null; then
+        echo -e "${GREEN}✓ Configuración válida${NC}"
+        if sudo systemctl reload nginx 2>/dev/null || sudo nginx -s reload 2>/dev/null; then
+            echo -e "${GREEN}✓ Nginx recargado${NC}"
+            success_steps+=("Nginx recargado")
+        else
+            echo -e "${YELLOW}⚠ Advertencia: No se pudo recargar Nginx${NC}"
+            errors+=("Error al recargar Nginx")
+        fi
+    else
+        echo -e "${RED}✗ Error en la configuración de Nginx${NC}"
+        sudo nginx -t
+        errors+=("Error en configuración de Nginx")
+        return 1
+    fi
+    
+    # Mostrar resumen
+    echo -e "\n${BLUE}${BOLD}Resumen de renombrado:${NC}"
+    if [ ${#success_steps[@]} -gt 0 ]; then
+        echo -e "${GREEN}Operaciones exitosas:${NC}"
+        for step in "${success_steps[@]}"; do
+            echo -e "  ✓ $step"
+        done
+    fi
+    
+    if [ ${#errors[@]} -gt 0 ]; then
+        echo -e "\n${RED}Errores encontrados:${NC}"
+        for error in "${errors[@]}"; do
+            echo -e "  ✗ $error"
+        done
+        return 1
+    else
+        echo -e "\n${GREEN}${BOLD}✓ Sitio renombrado correctamente${NC}\n"
+        return 0
+    fi
+}
+
+select_site_to_rename() {
+    if [ ${#RENAME_SITES_LIST[@]} -eq 0 ]; then
+        return 1
+    fi
+    
+    read -p "Selecciona el número del sitio a renombrar (o 'q' para cancelar): " selection
+    
+    if [[ "$selection" =~ ^[Qq]$ ]]; then
+        echo -e "${YELLOW}Operación cancelada.${NC}\n"
+        return 1
+    fi
+    
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt ${#RENAME_SITES_LIST[@]} ]; then
+        echo -e "${RED}Selección inválida.${NC}\n"
+        return 1
+    fi
+    
+    local selected_index=$((selection - 1))
+    local selected_site="${RENAME_SITES_LIST[$selected_index]}"
+    
+    IFS='|' read -r site_file site_name domain <<< "$selected_site"
+    
+    # Si ya tiene nombre estándar, informar
+    if is_standard_name "$site_name"; then
+        echo -e "${GREEN}El sitio ya tiene un nombre estándar: $site_name${NC}\n"
+        return 1
+    fi
+    
+    # Si no tiene dominio, no se puede renombrar
+    if [ -z "$domain" ]; then
+        echo -e "${RED}Error: No se pudo determinar el dominio del sitio${NC}"
+        echo -e "${YELLOW}No se puede renombrar sin un dominio válido.${NC}\n"
+        return 1
+    fi
+    
+    local suggested_name="${domain}.conf"
+    
+    echo -e "\n${YELLOW}${BOLD}Sitio seleccionado:${NC}"
+    echo -e "  ${CYAN}Archivo actual:${NC} $site_file"
+    echo -e "  ${CYAN}Nombre actual:${NC} $site_name"
+    echo -e "  ${CYAN}Dominio:${NC} $domain"
+    echo -e "  ${CYAN}Nombre sugerido:${NC} $suggested_name"
+    echo ""
+    
+    read -p "¿Deseas renombrar a '$suggested_name'? (s/n): " confirm
+    
+    if [[ ! "$confirm" =~ ^[Ss]$ ]]; then
+        read -p "Ingresa el nuevo nombre (debe terminar en .conf): " custom_name
+        
+        if [ -z "$custom_name" ]; then
+            echo -e "${RED}Nombre no proporcionado. Operación cancelada.${NC}\n"
+            return 1
+        fi
+        
+        if [[ ! "$custom_name" =~ \.conf$ ]]; then
+            echo -e "${RED}El nombre debe terminar en .conf${NC}\n"
+            return 1
+        fi
+        
+        suggested_name="$custom_name"
+    fi
+    
+    rename_site "$site_file" "$site_name" "$domain" "$suggested_name"
+    return $?
+}
+
+standardize_all_sites() {
+    echo -e "\n${BLUE}${BOLD}${SEPARATOR}${NC}"
+    echo -e "${BLUE}${BOLD}           ESTANDARIZAR TODOS LOS SITIOS${NC}"
+    echo -e "${BLUE}${BOLD}${SEPARATOR}${NC}\n"
+    
+    local sites_to_standardize=()
+    local index=1
+    
+    # Buscar sitios no estándar
+    if [ -d "$NGINX_SITES_AVAILABLE" ]; then
+        for site_file in "$NGINX_SITES_AVAILABLE"/*; do
+            if [ -f "$site_file" ] && [[ ! "$site_file" =~ default$ ]]; then
+                local site_name=$(basename "$site_file")
+                if ! is_standard_name "$site_name"; then
+                    local domain=$(get_domain_from_config "$site_file")
+                    if [ -n "$domain" ]; then
+                        sites_to_standardize+=("$site_file|$site_name|$domain")
+                    fi
+                fi
+            fi
+        done
+    fi
+    
+    if [ -d "$NGINX_CONF_DIR" ]; then
+        for site_file in "$NGINX_CONF_DIR"/*.conf; do
+            if [ -f "$site_file" ]; then
+                local site_name=$(basename "$site_file")
+                if ! is_standard_name "$site_name"; then
+                    local domain=$(get_domain_from_config "$site_file")
+                    if [ -n "$domain" ]; then
+                        sites_to_standardize+=("$site_file|$site_name|$domain")
+                    fi
+                fi
+            fi
+        done
+    fi
+    
+    if [ ${#sites_to_standardize[@]} -eq 0 ]; then
+        echo -e "${GREEN}✓ Todos los sitios ya tienen nombres estándar${NC}\n"
+        return 0
+    fi
+    
+    echo -e "${CYAN}Sitios que serán estandarizados:${NC}\n"
+    for site_info in "${sites_to_standardize[@]}"; do
+        IFS='|' read -r site_file site_name domain <<< "$site_info"
+        local new_name="${domain}.conf"
+        echo -e "  $index) $site_name → $new_name"
+        ((index++))
+    done
+    
+    echo ""
+    read -p "¿Deseas estandarizar estos ${#sites_to_standardize[@]} sitios? (s/n): " confirm
+    
+    if [[ ! "$confirm" =~ ^[Ss]$ ]]; then
+        echo -e "${YELLOW}Operación cancelada.${NC}\n"
+        return 1
+    fi
+    
+    local success_count=0
+    local error_count=0
+    
+    for site_info in "${sites_to_standardize[@]}"; do
+        IFS='|' read -r site_file site_name domain <<< "$site_info"
+        local new_name="${domain}.conf"
+        
+        echo -e "\n${CYAN}Estandarizando: $site_name → $new_name${NC}"
+        if rename_site "$site_file" "$site_name" "$domain" "$new_name"; then
+            ((success_count++))
+        else
+            ((error_count++))
+        fi
+    done
+    
+    echo -e "\n${BLUE}${BOLD}Resumen de estandarización:${NC}"
+    echo -e "${GREEN}✓ Sitios estandarizados: $success_count${NC}"
+    echo -e "${RED}✗ Errores: $error_count${NC}"
+    echo ""
+    
+    return 0
+}
+
+###############################################################################
 # FUNCIÓN PRINCIPAL
 ###############################################################################
 
@@ -1023,10 +1455,12 @@ show_main_menu() {
     echo -e "${CYAN}¿Qué deseas hacer?${NC}"
     echo -e "  1) Configurar nuevos sitios para contenedores Docker"
     echo -e "  2) Eliminar un sitio existente"
-    echo -e "  3) Solo mostrar información (sin cambios)"
-    echo -e "  4) Salir"
+    echo -e "  3) Renombrar un sitio"
+    echo -e "  4) Estandarizar todos los sitios"
+    echo -e "  5) Solo mostrar información (sin cambios)"
+    echo -e "  6) Salir"
     echo ""
-    read -p "Opción (1-4): " main_option
+    read -p "Opción (1-6): " main_option
     
     case $main_option in
         1)
@@ -1036,10 +1470,16 @@ show_main_menu() {
             return 2  # Eliminar sitio
             ;;
         3)
-            return 3  # Solo información
+            return 3  # Renombrar sitio
             ;;
         4)
-            return 4  # Salir
+            return 4  # Estandarizar sitios
+            ;;
+        5)
+            return 5  # Solo información
+            ;;
+        6)
+            return 6  # Salir
             ;;
         *)
             echo -e "${RED}Opción inválida.${NC}\n"
@@ -1086,11 +1526,21 @@ main() {
                 fi
                 ;;
             3)
+                # Renombrar sitio
+                if list_sites_for_rename; then
+                    select_site_to_rename
+                fi
+                ;;
+            4)
+                # Estandarizar todos los sitios
+                standardize_all_sites
+                ;;
+            5)
                 # Solo mostrar información
                 echo -e "\n${GREEN}Información mostrada. No se realizaron cambios.${NC}\n"
                 break
                 ;;
-            4)
+            6)
                 # Salir
                 echo -e "\n${GREEN}Saliendo...${NC}\n"
                 break
