@@ -1,0 +1,48 @@
+(async function deleteForce() {
+    let atToken = window.WIZ_global_data?.["SNlM0e"] || 
+                 document.body.innerHTML.match(/"SNlM0e":"(.*?)"/)?.[1];
+
+    if (!atToken) {
+        console.error("No se encontró el token 'at'.");
+        return;
+    }
+
+    // Buscamos los contenedores de los chats para extraer el ID real del atributo
+    const chatElements = document.querySelectorAll('a[data-test-id="chat-history-item"], a[href*="/app/"]');
+    const ids = [...new Set(Array.from(chatElements).map(el => {
+        const href = el.getAttribute('href');
+        const match = href.match(/\/app\/([a-z0-9_]+)/);
+        return match ? match[1] : null;
+    }))].filter(id => id && id !== 'home');
+
+    console.log(`%c Se intentará borrar ${ids.length} chats identificados.`, "color: orange; font-weight: bold;");
+
+    for (const id of ids) {
+        const formattedId = id.startsWith('c_') ? id : `c_${id}`;
+        console.log(`Enviando petición de borrado para: ${formattedId}`);
+
+        // Usaremos el rpcid GzXR5e que es más directo para "Eliminar"
+        const fReq = `[[["GzXR5e","[\\"${formattedId}\\"]",null,"generic"]]]`;
+        
+        try {
+            const res = await fetch(`https://gemini.google.com/_/BardChatUi/data/batchexecute?rpcids=GzXR5e&source-path=%2Fapp`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+                body: new URLSearchParams({ 'f.req': fReq, 'at': atToken })
+            });
+
+            const text = await res.text();
+            
+            // Si la respuesta contiene el ID, es que se procesó
+            if (text.includes(id) || res.ok) {
+                console.log(`%c[PETICIÓN ENVIADA] ${formattedId}`, "color: #00ff00;");
+            }
+        } catch (e) {
+            console.error("Error en ID " + id, e);
+        }
+
+        await new Promise(r => setTimeout(r, 2000));
+    }
+
+    console.log("%c--- Finalizado. REFRESCAR PÁGINA (F5) para confirmar ---", "color: yellow;");
+})();
